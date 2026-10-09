@@ -1940,6 +1940,8 @@ Status CompactionJob::OpenCompactionOutputFile(SubcompactionState* sub_compact,
   }
 
   writable_file->SetIOPriority(GetRateLimiterPriority());
+  // The level must be known before the hint, see BuildTable().
+  writable_file->SetSstLevel(sub_compact->compaction->output_level());
   writable_file->SetWriteLifeTimeHint(write_hint_);
   FileTypeSet tmp_set = db_options_.checksum_handoff_file_types;
   writable_file->SetPreallocationBlockSize(static_cast<size_t>(

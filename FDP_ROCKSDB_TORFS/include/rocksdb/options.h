@@ -717,6 +717,23 @@ struct DBOptions {
   //   all log files in wal_dir and the dir itself is deleted
   std::string wal_dir = "";
 
+  // Set by db_bench. If false (e.g. for the YCSB driver), the DB prints its
+  // "rocksdb.stats" property to stdout when it is destroyed.
+  // Default: false
+  bool is_db_bench = false;
+
+  // Data placement policy for FDP-aware file systems, passed to
+  // FileSystem::SetStreamOption() when the DB is opened; other file systems
+  // ignore it. Policies of the TorFS plugin (see plugin/torfs/README.md):
+  //   0: WAL and SST files use PID 0
+  //   1: PID derived from the write-life-time hint (WAL 1, SST 2..4)
+  //   2: per-level PIDs (WAL 1, SST at level L uses PID L + 2)
+  //   3: reserved, no policy (files keep the PID chosen at creation)
+  //   4: experimental, one reclaim group per level
+  // Stored in the OPTIONS file as "stream_option"; db_bench --stream_option.
+  // Default: 0
+  uint64_t stream_option = 0;
+
   // The periodicity when obsolete files get deleted. The default
   // value is 6 hours. The files that get out of scope by compaction
   // process will still get automatically delete on every compaction,

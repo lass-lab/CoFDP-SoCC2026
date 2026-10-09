@@ -47,11 +47,17 @@
 #define FDP_DEBUG_W (FDP_DEBUG && 1)  /* Write and Sync */
 #define FDP_DEBUG_AF (FDP_DEBUG && 1) /* Append and Flush */
 #define FDP_META_DEBUG 0              /* MetaData Flush and Recover */
-#define FDP_META_ENABLED 1            /* Enable MetaData 0:Close   1:Open */
+// Disabled in this fork: TorFS keeps its file map in memory only, so every
+// process starts with an empty file system (KNOWN_ISSUES TORFS-M1), and the
+// metadata segments at the start of the device
+// (MAX_META_SEGMENTS * META_SEGMENT_CAPACITY) stay unused. Re-enabling it
+// needs more than this switch: NewFDPFS() creates the TorFS log as a TorFS
+// file before LoadMetaData(), which may clear the file map.
+#define FDP_META_ENABLED 0            /* Enable MetaData 0:Close   1:Open */
 
 #define FDP_PREFETCH 0
 #define FDP_PREFETCH_BUF_SZ (1024 * 1024 * 1) /* 1MB */
-#define MAX_PID 5
+#define MAX_PID 8
 #define MAX_META_SEGMENTS 2
 #define NR_DEALLOCATE_THREADS 8
 #define FILE_METADATA_BUF_SIZE (1024 * 1024 * 1024)
@@ -60,7 +66,23 @@
 #define FDP_RU_SIZE 13079937024ul
 #define META_SEGMENT_CAPACITY (1 * 1024 * 1024 * 1024ul)
 
+// PID of files whose name contains "MANIFEST"; every other file is created
+// with PID 0. RocksDB gives MANIFEST files no write-life-time hint, so they
+// keep this PID under every stream_option.
+#define TORFS_MANIFEST_PID (MAX_PID - 1)
+
 namespace rocksdb {
+
+// PID policies of FDPWritableFile::SetWriteLifeTimeHint(), selected with
+// DBOptions::stream_option (db_bench --stream_option, OPTIONS file key
+// "stream_option"). The values are part of that interface.
+enum class TorfsStreamOption : uint64_t {
+  kNoStream = 0,               // WAL and SST files use PID 0
+  kWriteLifeTimeHint = 1,      // PID = hint - WLTH_SHORT + 1 (WAL 1, SST 2..4)
+  kLevelSeparation = 2,        // WAL: PID 1, SST at level L: PID L + 2
+  kReserved = 3,               // no policy: files keep their creation PID
+  kPerLevelReclaimGroup = 4,   // experimental: one reclaim group per level
+};
 
 struct Segment {
   uint64_t offset;
@@ -83,8 +105,11 @@ class FDPFile {
   std::string name_;
   size_t size_;
   uint64_t uuididx_;
+  // LSM level of an SST file, set by FDPWritableFile::SetSstLevel().
   int level_;
-  int pid_;
+  bool is_sst_ = false;
+  // PID sent with every write of this file.
+  int pid_ = 0;
   std::vector<Segment> file_segments_;
   uint32_t cur_seg_idx_;
   std::shared_ptr<Logger> logger_;
@@ -125,12 +150,19 @@ class TorFS : public FileSystemWrapper {
   uint64_t block_size_;
   MetaSegment meta_segments_[MAX_META_SEGMENTS];
   uint8_t cur_segment_;
+  // {largest placement handle, largest reclaim group} of the device.
+  std::vector<uint64_t> pid_info_;
   port::Mutex meta_mutex_;
   std::unique_ptr<std::thread> deallocate_worker_[NR_DEALLOCATE_THREADS] = {
       nullptr};
   std::priority_queue<Segment> deallocate_queue_;
   port::Mutex deallocate_mutex_;
   std::shared_ptr<IOInterface> io_interface_;
+  // Bytes requested by reads of TorFS files and the part of them served from
+  // a file's unflushed write buffer ("CACHE HIT" in the stats printed by
+  // ~TorFS()).
+  std::atomic<uint64_t> cache_read_hit_size_{0};
+  std::atomic<uint64_t> cache_read_size_{0};
 
   explicit TorFS(std::shared_ptr<FileSystem> aux_fs, const std::string& option,
                  std::shared_ptr<Logger> logger);
@@ -217,9 +249,50 @@ class TorFS : public FileSystemWrapper {
   void SubmitDeallocate(const Segment& seg);
   void UpdateSegments();
 
+  // Set by every DB opened on this file system, see TorfsStreamOption.
+  void SetStreamOption(uint64_t stream_option) override {
+    stream_option_ = stream_option;
+  }
+  uint64_t GetStreamOption() const { return stream_option_; }
+
+  // Cumulative latency of the I/O steps timed with TorFSStopWatch, printed
+  // by ~TorFS(). All step names are registered by the constructor, so the
+  // map is never modified concurrently; only the counters change.
+  struct BreakDown {
+    std::atomic<uint64_t> count_{0};
+    std::atomic<uint64_t> us_{0};
+  };
+  void AddBreakDown(const std::string& name, uint64_t us);
+  void PrintCumulativeBreakDown();
+
+  // Adds the lifetime of its scope, in microseconds, to the breakdown entry
+  // `name`.
+  struct TorFSStopWatch {
+    TorFSStopWatch(const char* name, TorFS* fs) : name_(name), fs_(fs) {
+      clock_gettime(CLOCK_MONOTONIC, &start_timespec_);
+    }
+    ~TorFSStopWatch() {
+      struct timespec end_timespec;
+      clock_gettime(CLOCK_MONOTONIC, &end_timespec);
+      long elapsed_ns =
+          (end_timespec.tv_sec - start_timespec_.tv_sec) * 1000000000 +
+          (end_timespec.tv_nsec - start_timespec_.tv_nsec);
+      if (fs_) {
+        fs_->AddBreakDown(name_, elapsed_ns / 1000);
+      }
+    }
+
+    const char* name_;
+    TorFS* fs_;
+    struct timespec start_timespec_;
+  };
+
  private:
   bool run_deallocate_worker_ = false;
   void DeallocateWorker();
+
+  uint64_t stream_option_ = 0;
+  std::map<std::string, BreakDown> breakdown_map_;
 };
 
 class FDPSequentialFile : public FSSequentialFile {
@@ -359,10 +432,13 @@ class FDPWritableFile : public FSWritableFile {
   uint64_t GetFileSize(const IOOptions& , IODebugContext*) override;
   IOStatus InvalidateCache(size_t offset, size_t length) override;
   void SetWriteLifeTimeHint(Env::WriteLifeTimeHint hint) override;
+  void SetSstLevel(int level) override;
   size_t GetUniqueId(char* id, size_t max_size) const override;
   bool IsSyncThreadSafe() const override;
   bool use_direct_io() const override;
   size_t GetRequiredBufferAlignment() const override;
+
+  FDPFile* fdp_file() const { return fdp_file_; }
 };
 
 int ParseTorfsOption(std::string option, TorfsConfig* config);

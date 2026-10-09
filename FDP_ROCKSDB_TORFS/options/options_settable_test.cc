@@ -239,6 +239,8 @@ TEST_F(OptionsSettableTest, DBOptionsAllFieldsSettable) {
       {offsetof(struct DBOptions, db_paths), sizeof(std::vector<DbPath>)},
       {offsetof(struct DBOptions, db_log_dir), sizeof(std::string)},
       {offsetof(struct DBOptions, wal_dir), sizeof(std::string)},
+      // Set by db_bench only, not an OPTIONS file option.
+      {offsetof(struct DBOptions, is_db_bench), sizeof(bool)},
       {offsetof(struct DBOptions, write_buffer_manager),
        sizeof(std::shared_ptr<WriteBufferManager>)},
       {offsetof(struct DBOptions, listeners),
@@ -366,7 +368,8 @@ TEST_F(OptionsSettableTest, DBOptionsAllFieldsSettable) {
                              "lowest_used_cache_tier=kNonVolatileBlockTier;"
                              "allow_data_in_errors=false;"
                              "enforce_single_del_contracts=false;"
-                             "daily_offpeak_time_utc=08:30-19:00;",
+                             "daily_offpeak_time_utc=08:30-19:00;"
+                             "stream_option=2;",
                              new_options));
 
   ASSERT_EQ(unset_bytes_base, NumUnsetBytes(new_options_ptr, sizeof(DBOptions),

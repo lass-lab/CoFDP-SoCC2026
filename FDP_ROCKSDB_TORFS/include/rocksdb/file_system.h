@@ -539,6 +539,12 @@ class FileSystem : public Customizable {
                                const IOOptions& options, uint64_t* file_size,
                                IODebugContext* dbg) = 0;
 
+  // Passes DBOptions::stream_option, the data placement policy, to an
+  // FDP-aware file system such as the TorFS plugin (plugin/torfs). Every DB
+  // calls this when it is opened, so the policy of the DB opened last applies
+  // to the whole file system. The default implementation ignores it.
+  virtual void SetStreamOption(uint64_t /*stream_option*/) {}
+
   // Store the last modification time of fname in *file_mtime.
   virtual IOStatus GetFileModificationTime(const std::string& fname,
                                            const IOOptions& options,
@@ -1143,6 +1149,13 @@ class FSWritableFile {
     write_hint_ = hint;
   }
 
+  // Called on SST files written by flush or compaction, before
+  // SetWriteLifeTimeHint(), with the LSM level the file is written for (0 for
+  // flush output, the output level for compaction output). Lets an FDP-aware
+  // file system such as the TorFS plugin choose the placement by level. The
+  // default implementation ignores it.
+  virtual void SetSstLevel(int /*level*/) {}
+
   /*
    * If rate limiting is enabled, change the file-granularity priority used in
    * rate-limiting writes.
@@ -1508,6 +1521,10 @@ class FileSystemWrapper : public FileSystem {
     return target_->GetFileSize(f, options, s, dbg);
   }
 
+  void SetStreamOption(uint64_t stream_option) override {
+    target_->SetStreamOption(stream_option);
+  }
+
   IOStatus GetFileModificationTime(const std::string& fname,
                                    const IOOptions& options,
                                    uint64_t* file_mtime,
@@ -1788,6 +1805,8 @@ class FSWritableFileWrapper : public FSWritableFile {
   void SetWriteLifeTimeHint(Env::WriteLifeTimeHint hint) override {
     target_->SetWriteLifeTimeHint(hint);
   }
+
+  void SetSstLevel(int level) override { target_->SetSstLevel(level); }
 
   Env::WriteLifeTimeHint GetWriteLifeTimeHint() override {
     return target_->GetWriteLifeTimeHint();

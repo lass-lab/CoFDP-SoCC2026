@@ -91,6 +91,32 @@ int XNvmeBackend::Init() {
       throw std::invalid_argument("Failed to initialize xNVMe");
     }
   }
+
+  // Read the Reclaim Unit Handle Status (I/O Management Receive) to learn the
+  // largest placement handle and reclaim group of the device, see
+  // GetPidInfo(). Only the experimental stream_option 4 uses them.
+  struct xnvme_queue* xqueue = xnvme_queues_.front();
+  xnvme_queues_.pop();
+  struct xnvme_cmd_ctx* xnvme_ctx = xnvme_queue_get_cmd_ctx(xqueue);
+  xnvme_ctx->async.cb = async_cb;
+  xnvme_ctx->async.cb_arg = reinterpret_cast<void*>(xqueue);
+  xnvme_ctx->dev = dev_;
+  const uint32_t nsid = xnvme_dev_get_nsid(dev_);
+  err = xnvme_nvm_mgmt_recv(xnvme_ctx, nsid, NVME_IOMR_MO_RUH_STATUS, 1,
+                            &ruh_status_, sizeof(nvme_fdp_ruh_status));
+  if (err) {
+    torfs_perr("Failed to perform xnvme_nvm_mgmt_recv");
+    return err;
+  }
+  err = xnvme_queue_drain(xqueue);
+  if (err < 0) torfs_perr("Failed to drain xNVMe queue");
+  PlacementID pid;
+  for (int i = 0; i < ruh_status_.nruhsd; i++) {
+    pid.pid = ruh_status_.ruhss[i].pid;
+    max_ph_id_ = pid.ph > max_ph_id_ ? pid.ph : max_ph_id_;
+    max_rg_id_ = pid.rg > max_rg_id_ ? pid.rg : max_rg_id_;
+  }
+  xnvme_queues_.push(xqueue);
   return err;
 }
 
@@ -185,13 +211,9 @@ int XNvmeBackend::SubmitDeallocate(const DeviceGeometry& geo) {
   dsm_range->slba = geo.offset_ >> geo_->ssw;
   dsm_range->llb = geo.size_ >> geo_->ssw;
 
+  // NOTE: unlike upstream TorFS, a failed deallocation is not reported here,
+  // and callers ignore the result (KNOWN_ISSUES TORFS-7).
   err = xnvme_nvm_dsm(&ctx, nsid, dsm_range, 0, true, false, false);
-  if (err) {
-    torfs_perr(
-        "xnvme_nvm_dsm() [%d] dsm->cattr: [%u] dsm->slba: [%lu] dsm->llb: [%u] "
-        "nsid: [%u]",
-        err, dsm_range->cattr, dsm_range->slba, dsm_range->llb, nsid);
-  }
   xnvme_buf_free(dev_, reinterpret_cast<void*>(dsm_range));
   return err;
 }

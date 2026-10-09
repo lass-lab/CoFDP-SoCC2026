@@ -47,7 +47,10 @@ IOStatus FDPSequentialFile::ReadOffset(uint64_t offset, size_t n, Slice* result,
   }
 
   size_t cache_pos = fdp_file_->size_ - cache_len;
+  fs_tor_->cache_read_size_.fetch_add(n);
   if (offset >= (uint64_t)cache_pos) {
+    // Served from the unflushed write buffer.
+    fs_tor_->cache_read_hit_size_.fetch_add(n);
     *read_len = n;
     *result = Slice(fdp_file_->wcache_ + offset - cache_pos, n);
     return IOStatus::OK();
@@ -100,8 +103,11 @@ IOStatus FDPSequentialFile::ReadOffset(uint64_t offset, size_t n, Slice* result,
         tmp_size % fs_tor_->block_size_ == 0
             ? tmp_size
             : fs_tor_->block_size_ * (tmp_size / fs_tor_->block_size_ + 1);
-    err = fs_tor_->io_interface_->Read(read_align_off, read_align_size,
-                                       rcache + read_actual_sum);
+    {
+      TorFS::TorFSStopWatch t1("IOInterface::Read", fs_tor_);
+      err = fs_tor_->io_interface_->Read(read_align_off, read_align_size,
+                                         rcache + read_actual_sum);
+    }
     if (err) {
       fs_tor_->io_interface_->FreeBuf(rcache);
       return IOStatus::IOError("Failed to read data from file: %s",
@@ -210,9 +216,11 @@ IOStatus FDPRandomAccessFile::ReadOffset(uint64_t offset, size_t n,
         tmp_size % fs_tor_->block_size_ == 0
             ? tmp_size
             : fs_tor_->block_size_ * (tmp_size / fs_tor_->block_size_ + 1);
-
-    err = fs_tor_->io_interface_->Read(read_align_off, read_align_size,
-                                       rcache + readAlignSum);
+    {
+      TorFS::TorFSStopWatch t1("IOInterface::Read", fs_tor_);
+      err = fs_tor_->io_interface_->Read(read_align_off, read_align_size,
+                                         rcache + readAlignSum);
+    }
     if (err) {
       fs_tor_->io_interface_->FreeBuf(rcache);
       return IOStatus::IOError("Failed to read data from file: %s",
@@ -244,7 +252,10 @@ IOStatus FDPRandomAccessFile::Read(uint64_t offset, size_t n,
 
   size_t cache_len = fdp_file_->cache_offset_ - fdp_file_->wcache_;
   size_t cache_pos = fdp_file_->size_ - cache_len;
+  fs_tor_->cache_read_size_.fetch_add(n);
   if (offset >= cache_pos) {
+    // Served from the unflushed write buffer.
+    fs_tor_->cache_read_hit_size_.fetch_add(n);
     *result = Slice(fdp_file_->wcache_ + offset - cache_pos, n);
     return IOStatus::OK();
   }
@@ -441,21 +452,29 @@ IOStatus FDPWritableFile::DataSync() {
 
   uint32_t padding = 0;
   size_t newSize = size;
-  if (size % fs_tor_->block_size_ != 0) {
-    newSize = fs_tor_->block_size_ * (size / fs_tor_->block_size_ + 1);
+  const size_t write_unit = size_t{1} << TORFS_WRITE_UNIT_SHIFT;
+  if (size % write_unit != 0) {
+    newSize = write_unit * (size / write_unit + 1);
     padding = newSize - size;
   }
 
   std::vector<Segment> segs;
-  IOStatus s = fs_tor_->AllocCap(newSize, segs);
+  IOStatus s;
+  {
+    TorFS::TorFSStopWatch t1("AllocCap", fs_tor_);
+    s = fs_tor_->AllocCap(newSize, segs);
+  }
   if (!s.ok()) return s;
 
   uint64_t tsize = 0;
   int err = true;
   for (size_t i = 0; i < segs.size(); i++) {
-    err = fs_tor_->io_interface_->Write(segs[i].offset, segs[i].size,
-                                        fdp_file_->wcache_ + tsize,
-                                        fdp_file_->pid_);
+    {
+      TorFS::TorFSStopWatch t1("IOInterface::Write", fs_tor_);
+      err = fs_tor_->io_interface_->Write(segs[i].offset, segs[i].size,
+                                          fdp_file_->wcache_ + tsize,
+                                          fdp_file_->pid_);
+    }
     if (err) {
       return IOStatus::IOError("Failed to write data to the device");
     }
@@ -469,10 +488,12 @@ IOStatus FDPWritableFile::DataSync() {
     tsize += segs[i].size;
   }
 
-  fs_tor_->file_mutex_.Lock();
-  fs_tor_->FlushAppendMetaData(fdp_file_);
-  fs_tor_->file_mutex_.Unlock();
-
+  {
+    TorFS::TorFSStopWatch t1("FlushAppendMetaData", fs_tor_);
+    fs_tor_->file_mutex_.Lock();
+    fs_tor_->FlushAppendMetaData(fdp_file_);
+    fs_tor_->file_mutex_.Unlock();
+  }
   fdp_file_->cache_offset_ = fdp_file_->wcache_;
   return IOStatus::OK();
 }
@@ -483,11 +504,65 @@ IOStatus FDPWritableFile::InvalidateCache(size_t offset, size_t length) {
   return IOStatus::OK();
 }
 
+void FDPWritableFile::SetSstLevel(int level) {
+  fdp_file_->level_ = level;
+  fdp_file_->is_sst_ = true;
+}
+
+// Chooses the PID of a WAL, SST or blob file (RocksDB hints no other files)
+// by the policy selected with stream_option, see TorfsStreamOption. For SST
+// files, SetSstLevel() has been called before. RocksDB derives SST hints from
+// the level relative to the base level: L0 and the base level are MEDIUM, the
+// next level LONG, deeper levels EXTREME; WAL files are SHORT.
 void FDPWritableFile::SetWriteLifeTimeHint(Env::WriteLifeTimeHint hint) {
   write_hint_ = hint;
-  fdp_file_->level_ = hint - Env::WLTH_SHORT;
-  fdp_file_->pid_ =
-      fdp_file_->level_ >= MAX_PID ? (MAX_PID - 1) : fdp_file_->level_;
+  switch (static_cast<TorfsStreamOption>(fs_tor_->GetStreamOption())) {
+    case TorfsStreamOption::kNoStream:
+      fdp_file_->pid_ = 0;
+      break;
+    case TorfsStreamOption::kWriteLifeTimeHint:
+      // SHORT 1, MEDIUM 2, LONG 3, EXTREME 4.
+      if (hint < Env::WLTH_SHORT) {
+        fdp_file_->pid_ = 0;
+      } else {
+        fdp_file_->pid_ = hint - Env::WLTH_SHORT + 1;
+      }
+      break;
+    case TorfsStreamOption::kLevelSeparation:
+      // NOTE: not bounded by MAX_PID, so L5 shares PID 7 with the MANIFEST
+      // and L6 gets PID 8 (KNOWN_ISSUES TORFS-2).
+      if (hint < Env::WLTH_SHORT) {
+        fdp_file_->pid_ = 0;
+      } else if (!fdp_file_->is_sst_) {  // WAL or blob file
+        fdp_file_->pid_ = 1;
+      } else {
+        fdp_file_->pid_ = fdp_file_->level_ + 2;
+      }
+      break;
+    case TorfsStreamOption::kReserved:
+      break;
+    case TorfsStreamOption::kPerLevelReclaimGroup: {
+      // Reclaim group per class: WAL 1, SST min(level + 2, largest RG), in
+      // the RG byte of the PlacementID layout.
+      // NOTE: the placement handle is left uninitialized and the largest RG
+      // comes from the RUH status parsed in XNvmeBackend::Init()
+      // (KNOWN_ISSUES TORFS-6, TORFS-3).
+      PlacementID pid;
+      if (hint < Env::WLTH_SHORT) {
+        pid.rg = 0;
+      } else if (!fdp_file_->is_sst_) {  // WAL or blob file
+        pid.rg = 1;
+      } else {
+        const int max_rg = static_cast<int>(fs_tor_->pid_info_[1]);
+        pid.rg = fdp_file_->level_ + 2 >= max_rg ? max_rg
+                                                 : fdp_file_->level_ + 2;
+      }
+      fdp_file_->pid_ = pid.pid;
+      break;
+    }
+    default:
+      break;
+  }
 }
 
 IOStatus FDPWritableFile::RangeSync(uint64_t offset, uint64_t nbytes,

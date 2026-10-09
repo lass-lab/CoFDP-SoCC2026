@@ -24,6 +24,7 @@
 #include <memory>
 #include <queue>
 #include <string>
+#include <vector>
 
 #include "port/port.h"
 #include "rocksdb/env.h"
@@ -35,12 +36,33 @@ namespace rocksdb {
 #define MAX_NR_QUEUE 128
 #define THREAD_NUM 4
 #define TORFS_MAX_BUF (8 * 1024 * 1024)
-#define TORFS_ALIGNMENT 4096
+// Slack of the read bounce buffers and size of the metadata superblock
+// (upstream TorFS: 4096).
+#define TORFS_ALIGNMENT (16 * 1024)
 #define MAX_IO_SIZE 65536u
+// Each flush of a file buffer is padded to a multiple of 1 << 14 = 16 KiB, so
+// every TorFS data write is 16 KiB aligned (upstream TorFS pads to the LBA
+// size).
+#define TORFS_WRITE_UNIT_SHIFT 14
 
 enum TorfsDIO {
   DIO_READ = 0,
   DIO_WRITE,
+};
+
+// Placement ID (PID) layout assumed by TorFS: placement handle (PH) in the low
+// byte, reclaim group (RG) in the high byte. Only the experimental
+// stream_option 4 and the parsing of the reclaim unit handle status use it;
+// the other policies send plain PIDs. NOTE: the FEMU FDP device of this
+// artifact numbers PIDs flat instead (RG = PID / placement handles per RG).
+struct PlacementID {
+  union {
+    struct {
+      uint32_t ph : 8;
+      uint32_t rg : 8;
+    };
+    uint16_t pid;
+  };
 };
 
 extern void torfs_perr(const char* format, ...);
@@ -88,6 +110,9 @@ class Backend {
   virtual void FreeBuf(void* buf, uint32_t size) = 0;
   virtual int Init() = 0;
   virtual void Exit() = 0;
+  // Returns {largest placement handle, largest reclaim group} reported by the
+  // device's reclaim unit handle status.
+  virtual void GetPidInfo(std::vector<uint64_t>& info) = 0;
 
  protected:
   virtual int Async(const DeviceGeometry& geo, TorfsDIO dio) = 0;
@@ -107,6 +132,9 @@ class IOInterface {
   void* AllocBuf(uint32_t size);
   void FreeBuf(void* buf);
   void FreeBuf(void* buf, uint32_t size);
+  void GetPidInfo(std::vector<uint64_t>& info) {
+    be_interface_->GetPidInfo(info);
+  }
   std::shared_ptr<Backend> be_interface_{};
 
  private:

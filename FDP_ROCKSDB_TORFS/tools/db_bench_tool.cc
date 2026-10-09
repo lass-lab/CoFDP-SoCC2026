@@ -799,6 +799,13 @@ DEFINE_bool(read_cache_direct_read, true,
 
 DEFINE_bool(use_keep_filter, false, "Whether to use a noop compaction filter");
 
+DEFINE_uint64(stream_option, 0,
+              "Data placement policy of FDP-aware file systems such as TorFS "
+              "(Options.stream_option): 0 = PID 0 for WAL and SST files, "
+              "1 = PID from the write-life-time hint, 2 = per-level PIDs, "
+              "3 = reserved (no policy), 4 = per-level reclaim groups "
+              "(experimental)");
+
 static bool ValidateCacheNumshardbits(const char* flagname, int32_t value) {
   if (value >= 20) {
     fprintf(stderr, "Invalid value for --%s: %d, must be < 20\n", flagname,
@@ -4182,6 +4189,8 @@ class Benchmark {
 
     assert(db_.db == nullptr);
 
+    options.is_db_bench = true;
+    options.stream_option = FLAGS_stream_option;
     options.env = FLAGS_env;
     options.wal_dir = FLAGS_wal_dir;
     options.dump_malloc_stats = FLAGS_dump_malloc_stats;

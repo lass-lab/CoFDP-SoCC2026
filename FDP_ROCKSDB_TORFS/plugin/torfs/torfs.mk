@@ -10,7 +10,8 @@ torfs_SOURCES = fs/fs_torfs.cc \
 torfs_HEADERS = fs/fs_torfs.h \
                 fs/io_torfs.h \
                 fs/xnvme_be.h \
-                fs/meta_torfs.h
+                fs/meta_torfs.h \
+                fs/torfs_logger.h
 
 torfs_LDFLAGS = -Wl,--whole-archive \
                 -Wl,--no-as-needed \

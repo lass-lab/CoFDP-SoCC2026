@@ -26,6 +26,40 @@
 
 namespace rocksdb {
 
+// Management operations of the NVMe I/O Management Receive command.
+enum NvmeIomr2Mo {
+  NVME_IOMR_MO_NOP = 0x0,
+  NVME_IOMR_MO_RUH_STATUS = 0x1,
+};
+
+struct nvme_fdp_ruh_status_desc {
+  uint16_t pid;
+  uint16_t ruhid;
+  uint32_t earutr;
+  uint64_t ruamw;
+  uint8_t rsvd16[16];
+};
+
+// Reclaim Unit Handle Status, returned for NVME_IOMR_MO_RUH_STATUS.
+// NOTE: the anonymous struct (vendor statistics that no device fills) pads the
+// 14 reserved header bytes to 20, so nruhsd and ruhss[] are read at offsets 20
+// and 24 instead of 14 and 16 (KNOWN_ISSUES TORFS-3). The layout is kept
+// because sizeof() of this struct (8216 bytes) is the transfer size of the
+// command issued in XNvmeBackend::Init().
+struct nvme_fdp_ruh_status {
+  union {
+    struct {
+      uint8_t free_space_ratio;
+      uint32_t copied_page;
+      uint32_t block_erased;
+      uint8_t rsvd0_tmp[5];
+    };
+    uint8_t rsvd0[14];
+  };
+  uint16_t nruhsd;
+  struct nvme_fdp_ruh_status_desc ruhss[256];
+};
+
 class XNvmeBackend : public Backend {
  public:
   XNvmeBackend() {}
@@ -35,6 +69,7 @@ class XNvmeBackend : public Backend {
   std::string async_io;
   port::Mutex xnvme_mutex_;
   struct xnvme_dev* dev_ = nullptr;
+  struct nvme_fdp_ruh_status ruh_status_;
   const struct xnvme_geo* geo_ = nullptr;
   struct xnvme_queue* queues_[MAX_NR_QUEUE];
   std::queue<void*> big_buf_queue_;
@@ -46,6 +81,11 @@ class XNvmeBackend : public Backend {
   int DeallocateImpl(const DeviceGeometry& geo);
   void SetDev(const std::string& name) { dev = name; }
   void SetAsyncType(const std::string& type) { async_io = type; }
+  void GetPidInfo(std::vector<uint64_t>& info) override {
+    info.clear();
+    info.push_back(max_ph_id_);
+    info.push_back(max_rg_id_);
+  }
 
  private:
   int Async(const DeviceGeometry& geo, TorfsDIO dio);
@@ -58,6 +98,10 @@ class XNvmeBackend : public Backend {
   int SubmitXNvmeAsyncCmd(struct xnvme_queue* xqueue, const DeviceGeometry& geo,
                           TorfsDIO dio);
   int SubmitDeallocate(const DeviceGeometry& geo);
+
+  // Largest placement handle and reclaim group in the RUH status.
+  uint64_t max_ph_id_ = 0;
+  uint64_t max_rg_id_ = 0;
 };
 
 class XNvmeBlock : public XNvmeBackend {

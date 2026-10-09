@@ -295,6 +295,8 @@ DBImpl::DBImpl(const DBOptions& options, const std::string& dbname,
   if (write_buffer_manager_) {
     wbm_stall_.reset(new WBMStallInterface());
   }
+
+  fs_->SetStreamOption(immutable_db_options_.stream_option);
 }
 
 Status DBImpl::Resume() {
@@ -721,6 +723,18 @@ DBImpl::~DBImpl() {
   ThreadStatus::OperationType cur_op_type =
       ThreadStatusUtil::GetThreadOperation();
   ThreadStatusUtil::SetThreadOperation(ThreadStatus::OperationType::OP_UNKNOWN);
+
+  // Clients other than db_bench (the YCSB driver) report the DB statistics
+  // when the DB is destroyed. The default column family handle is null if the
+  // DB was already closed or never opened successfully; there is nothing to
+  // report then.
+  if (!immutable_db_options_.is_db_bench && default_cf_handle_ != nullptr) {
+    std::string stats;
+    GetProperty("rocksdb.stats", &stats);
+    printf("==============================~DBImpl=========================\n");
+    printf("%s\n", stats.c_str());
+    printf("==============================~DBImpl=========================\n");
+  }
 
   // TODO: remove this.
   init_logger_creation_s_.PermitUncheckedError();

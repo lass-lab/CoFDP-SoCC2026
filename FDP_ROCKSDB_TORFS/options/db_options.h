@@ -104,6 +104,9 @@ struct ImmutableDBOptions {
   Logger* logger;
   std::shared_ptr<CompactionService> compaction_service;
   bool enforce_single_del_contracts;
+  // See DBOptions::stream_option and DBOptions::is_db_bench.
+  uint64_t stream_option;
+  bool is_db_bench;
 
   bool IsWalDirSameAsDBPath() const;
   bool IsWalDirSameAsDBPath(const std::string& path) const;

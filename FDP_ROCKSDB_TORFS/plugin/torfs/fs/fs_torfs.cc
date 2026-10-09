@@ -27,6 +27,7 @@
 #include "meta_torfs.h"
 #include "rocksdb/options.h"
 #include "rocksdb/slice.h"
+#include "torfs_logger.h"
 
 namespace rocksdb {
 
@@ -36,6 +37,11 @@ const char *async_str[] = {"thrpool",
                             "io_uring_cmd",
                             "nvme"};
 const std::string& TORFS_LOG = "/mnt/rocksdb_torfs.log";
+
+// Steps timed with TorFS::TorFSStopWatch (fs_torfs_io.cc).
+static const char* const kBreakDownNames[] = {
+    "AllocCap", "FlushAppendMetaData", "IOInterface::Read",
+    "IOInterface::Write"};
 
 FDPFile::FDPFile(const std::string& fname, int lvl, int placementId,
                  std::shared_ptr<IOInterface> io_interface,
@@ -119,6 +125,7 @@ TorFS::TorFS(std::shared_ptr<FileSystem> aux_fs, const std::string& option,
   if (err) throw(err);
 
   io_interface_ = std::make_shared<IOInterface>(torfs_config);
+  io_interface_->GetPidInfo(pid_info_);
   block_size_ = io_interface_->GetBlockSize();
   max_capacity_ = io_interface_->GetNlba() * block_size_;
   dev_offset_ = META_SEGMENT_CAPACITY * MAX_META_SEGMENTS;
@@ -135,6 +142,10 @@ TorFS::TorFS(std::shared_ptr<FileSystem> aux_fs, const std::string& option,
     seg_queue_used_cap_[i] = 0;
   }
 
+  for (const char* name : kBreakDownNames) {
+    breakdown_map_.try_emplace(name);
+  }
+
   avail_capacity_ = max_capacity_ - dev_offset_;
   Segment first_seg;
   first_seg.offset = dev_offset_;
@@ -149,6 +160,7 @@ TorFS::TorFS(std::shared_ptr<FileSystem> aux_fs, const std::string& option,
 }
 
 TorFS::~TorFS() {
+  PrintCumulativeBreakDown();
   if (FDP_META_ENABLED) {
     io_interface_->FreeBuf(meta_buf_);
   }
@@ -156,6 +168,18 @@ TorFS::~TorFS() {
   run_deallocate_worker_ = false;
   for (int i = 0; i < NR_DEALLOCATE_THREADS; i++) {
     deallocate_worker_[i]->join();
+  }
+
+  // Each logger from NewLogger() writes to an FDPFile and is kept alive by
+  // logger_ and by the FDPFile::logger_ of files created after it. Drop all
+  // these references before any FDPFile is deleted, so that a logger that was
+  // never closed (the TorFS log, the loggers of DestroyDB()) is closed while
+  // its file still exists.
+  logger_.reset();
+  for (auto& it : files_) {
+    if (it.second != nullptr) {
+      it.second->logger_.reset();
+    }
   }
 
   for (auto& it : files_) {
@@ -169,8 +193,36 @@ TorFS::~TorFS() {
     meta_segments_[seg].io_interface_.reset();
   }
   io_interface_.reset();
-  // TORFS_INFO("Destroying TorFS Environment");
-  Info(logger_, "Destroying TorFS Environment");
+}
+
+void TorFS::AddBreakDown(const std::string& name, uint64_t us) {
+  auto it = breakdown_map_.find(name);
+  assert(it != breakdown_map_.end());
+  if (it == breakdown_map_.end()) {
+    return;
+  }
+  it->second.count_++;
+  it->second.us_ += us;
+}
+
+// Prints the share of read bytes served from write buffers (in 1/10000) and,
+// for every timed step that ran, "<step> : <total us>/<count> = <mean us>".
+// This is measurement output: keep its format, including the missing newline
+// after the CACHE HIT figure.
+void TorFS::PrintCumulativeBreakDown() {
+  if (cache_read_size_.load()) {
+    printf("CACHE HIT %lu / %lu = %lu", cache_read_hit_size_.load(),
+           cache_read_size_.load(),
+           (cache_read_hit_size_.load() * 10000) / cache_read_size_.load());
+  }
+  for (const auto& it : breakdown_map_) {
+    uint64_t count = it.second.count_;
+    if (count == 0) {
+      continue;
+    }
+    uint64_t us = it.second.us_;
+    printf("%s : %lu/%lu = %lu\n", it.first.c_str(), us, count, us / count);
+  }
 }
 
 std::string TorFS::ToAuxPath(std::string path) { return fs_path_ + path; }
@@ -214,8 +266,9 @@ IOStatus TorFS::NewWritableFile(const std::string& fname,
   std::string new_fname = NormalizePath(fname);
   uint32_t file_num = 0;
 
-  target_->NewWritableFile(new_fname, options, result, nullptr);
-
+  // Unlike upstream TorFS, no placeholder file is created in the host file
+  // system. GetChildren() still lists only the host directory, so directory
+  // scans such as DestroyDB() do not see TorFS files (KNOWN_ISSUES TORFS-5).
   file_mutex_.Lock();
   file_num = files_.count(new_fname);
   if (file_num != 0) {
@@ -225,7 +278,7 @@ IOStatus TorFS::NewWritableFile(const std::string& fname,
 
   int pId = 0;
   if (fname.find("MANIFEST") != std::string::npos) {
-    pId = 4;
+    pId = TORFS_MANIFEST_PID;
   }
 
   files_[new_fname] = new FDPFile(new_fname, 0, pId, io_interface_, logger_);
@@ -376,10 +429,27 @@ IOStatus TorFS::IsDirectory(const std::string& path, const IOOptions& options,
                             bool* is_dir, IODebugContext* dbg) {
   return target_->IsDirectory(path, options, is_dir, dbg);
 }
+
+// Unlike upstream TorFS, which logs to the host file system, logs are TorFS
+// files on the FDP device (see TorFSLogger). The logger created last also
+// receives the messages of TorFS itself.
 IOStatus TorFS::NewLogger(const std::string& fname, const IOOptions& options,
                           std::shared_ptr<Logger>* result,
                           IODebugContext* dbg) {
-  return target_->NewLogger(fname, options, result, dbg);
+  FileOptions foptions;
+  foptions.io_options = options;
+  std::unique_ptr<FSWritableFile> writable_file;
+  const IOStatus status = NewWritableFile(fname, foptions, &writable_file, dbg);
+  if (!status.ok()) {
+    return status;
+  }
+
+  *result =
+      std::make_shared<TorFSLogger>(std::move(writable_file), Env::Default());
+  // NOTE: logger_ is replaced without synchronization, and TorFS errors raised
+  // while this logger flushes are logged to itself (KNOWN_ISSUES TORFS-10).
+  logger_ = *result;
+  return IOStatus::OK();
 }
 
 const char* TorFS::Name() const {
@@ -948,6 +1018,8 @@ void TorFS::DeallocateWorker() {
       }
     }
 
+    // NOTE: as in upstream TorFS, the range is deallocated a second time
+    // whatever the branch above did (KNOWN_ISSUES TORFS-7).
     io_interface_->Deallocate(seg.offset, seg.size);
 
     ReclaimSeg(seg);
@@ -1115,14 +1187,15 @@ IOStatus NewFDPFS(FileSystem** torfs_env, const std::string& dev_name) {
         return IOStatus::Corruption("Failed to create TorFS log file");
     }
 
-    s = Env::Default()->NewLogger(torfs_log_path.c_str(), &logger);
+    // The TorFS log is a TorFS file itself, so TorFS is created first, without
+    // a logger.
+    TorFS* torFS = new TorFS(FileSystem::Default(), dev_name, logger);
+    s = torFS->NewLogger(torfs_log_path, IOOptions(), &logger, nullptr);
     if (!s.ok()) {
       return IOStatus::Corruption("Failed to create TorFS logger");
     } else {
       logger->SetInfoLogLevel(DEBUG_LEVEL);
     }
-
-    TorFS* torFS = new TorFS(FileSystem::Default(), dev_name, logger);
 
     *torfs_env = torFS;
 

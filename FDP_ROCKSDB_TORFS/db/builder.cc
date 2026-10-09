@@ -163,6 +163,9 @@ Status BuildTable(
       table_file_created = true;
       FileTypeSet tmp_set = ioptions.checksum_handoff_file_types;
       file->SetIOPriority(tboptions.write_options.rate_limiter_priority);
+      // The level must be known before the hint: level-aware placement
+      // (TorFS stream_option 2 and 4) uses both in SetWriteLifeTimeHint().
+      file->SetSstLevel(tboptions.level_at_creation);
       file->SetWriteLifeTimeHint(write_hint);
       file_writer.reset(new WritableFileWriter(
           std::move(file), fname, file_options, ioptions.clock, io_tracer,
