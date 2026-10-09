@@ -1,0 +1,5 @@
+# SPDX-License-Identifier: GPL-2.0-only
+/fdp-reset
+/fdp-ruh-status
+/fp-remap
+/pidirfs-mount
