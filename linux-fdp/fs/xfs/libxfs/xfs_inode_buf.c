@@ -243,6 +243,8 @@ xfs_inode_from_disk(
 		ip->i_crtime = xfs_inode_from_disk_ts(from, from->di_crtime);
 		ip->i_diflags2 = be64_to_cpu(from->di_flags2);
 		ip->i_cowextsize = be32_to_cpu(from->di_cowextsize);
+		/* CoFDP PinodeBlock: PID bits in di_pad2[0..3], big endian */
+		ip->i_pid_bitmap = get_unaligned_be32(from->di_pad2);
 	}
 
 	error = xfs_iformat_data_fork(ip, from);
@@ -339,7 +341,12 @@ xfs_inode_to_disk(
 		to->di_cowextsize = cpu_to_be32(ip->i_cowextsize);
 		to->di_ino = cpu_to_be64(ip->i_ino);
 		to->di_lsn = cpu_to_be64(lsn);
-		memset(to->di_pad2, 0, sizeof(to->di_pad2));
+		/*
+		 * CoFDP PinodeBlock: PID bits in di_pad2[0..3], big endian.
+		 * NOTE: not carried in log records, see KNOWN_ISSUES (XFS-4).
+		 */
+		put_unaligned_be32(ip->i_pid_bitmap, to->di_pad2);
+		memset(to->di_pad2 + 4, 0, sizeof(to->di_pad2) - 4);
 		uuid_copy(&to->di_uuid, &ip->i_mount->m_sb.sb_meta_uuid);
 		to->di_v3_pad = 0;
 	} else {

@@ -817,6 +817,10 @@ static struct request *attempt_merge(struct request_queue *q,
 	if (req->ioprio != next->ioprio)
 		return NULL;
 
+	/* CoFDP: never merge I/O destined for different FDP placement IDs */
+	if (req->fdp_pid != next->fdp_pid)
+		return NULL;
+
 	/*
 	 * If we are allowed to merge, then append bio list
 	 * from next to rq and release next. merge_requests_fn
@@ -920,6 +924,10 @@ bool blk_attempt_req_merge(struct request_queue *q, struct request *rq,
 bool blk_rq_merge_ok(struct request *rq, struct bio *bio)
 {
 	if (!rq_mergeable(rq) || !bio_mergeable(bio))
+		return false;
+
+	/* CoFDP: never merge I/O destined for different FDP placement IDs */
+	if (rq->fdp_pid != bio->fdp_pid)
 		return false;
 
 	if (req_op(rq) != bio_op(bio))

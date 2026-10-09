@@ -177,6 +177,7 @@ enum {
 	Opt_gc_merge,
 	Opt_nogc_merge,
 	Opt_discard_unit,
+	Opt_pid_logs,
 	Opt_memory_mode,
 	Opt_age_extent_cache,
 	Opt_errors,
@@ -257,6 +258,7 @@ static match_table_t f2fs_tokens = {
 	{Opt_gc_merge, "gc_merge"},
 	{Opt_nogc_merge, "nogc_merge"},
 	{Opt_discard_unit, "discard_unit=%s"},
+	{Opt_pid_logs, "fdp_log_n=%u"},
 	{Opt_memory_mode, "memory=%s"},
 	{Opt_age_extent_cache, "age_extent_cache"},
 	{Opt_errors, "errors=%s"},
@@ -690,6 +692,32 @@ static int f2fs_set_zstd_level(struct f2fs_sb_info *sbi, const char *str)
 }
 #endif
 #endif
+
+/*
+ * CoFDP: fdp_log_n=N gives every persistent curseg type N per-PID logs (PISA),
+ * bounded by the per-PID slots of the checkpoint. The logs are set up at
+ * mount time, so their number cannot change on remount.
+ */
+static int f2fs_set_pid_logs(struct f2fs_sb_info *sbi, int nr_logs,
+			     bool is_remount)
+{
+	int type;
+
+	if (nr_logs < 1 || nr_logs > F2FS_MAX_PID_LOGS) {
+		f2fs_err(sbi, "fdp_log_n must be between 1 and %d",
+			 F2FS_MAX_PID_LOGS);
+		return -EINVAL;
+	}
+	if (is_remount && nr_logs != sbi->pid_logs[CURSEG_HOT_DATA]) {
+		f2fs_err(sbi, "fdp_log_n cannot be changed by remount");
+		return -EINVAL;
+	}
+
+	F2FS_OPTION(sbi).nr_pid_logs = nr_logs;
+	for (type = CURSEG_HOT_DATA; type <= CURSEG_COLD_NODE; type++)
+		sbi->pid_logs[type] = nr_logs;
+	return 0;
+}
 
 static int parse_options(struct super_block *sb, char *options, bool is_remount)
 {
@@ -1296,6 +1324,13 @@ static int parse_options(struct super_block *sb, char *options, bool is_remount)
 			}
 			kfree(name);
 			break;
+		case Opt_pid_logs:
+			if (args->from && match_int(args, &arg))
+				return -EINVAL;
+			ret = f2fs_set_pid_logs(sbi, arg, is_remount);
+			if (ret)
+				return ret;
+			break;
 		case Opt_memory_mode:
 			name = match_strdup(&args[0]);
 			if (!name)
@@ -1716,6 +1751,7 @@ static void f2fs_put_super(struct super_block *sb)
 	f2fs_destroy_post_read_wq(sbi);
 
 	kvfree(sbi->ckpt);
+	kvfree(sbi->pidir_table);
 
 	sb->s_fs_info = NULL;
 	if (sbi->s_chksum_driver)
@@ -1733,8 +1769,7 @@ static void f2fs_put_super(struct super_block *sb)
 	fscrypt_free_dummy_policy(&F2FS_OPTION(sbi).dummy_enc_policy);
 	destroy_percpu_info(sbi);
 	f2fs_destroy_iostat(sbi);
-	for (i = 0; i < NR_PAGE_TYPE; i++)
-		kvfree(sbi->write_io[i]);
+	f2fs_destroy_write_merge_io(sbi);
 #if IS_ENABLED(CONFIG_UNICODE)
 	utf8_unload(sb->s_encoding);
 #endif
@@ -4452,6 +4487,10 @@ try_onemore:
 	sb->s_fs_info = sbi;
 	sbi->raw_super = raw_super;
 
+	/* PISA: a single log per curseg type unless fdp_log_n says otherwise */
+	for (int type = 0; type < NR_CURSEG_TYPE; type++)
+		sbi->pid_logs[type] = 1;
+
 	INIT_WORK(&sbi->s_error_work, f2fs_record_error_work);
 	memcpy(sbi->errors, raw_super->s_errors, MAX_F2FS_ERRORS);
 	memcpy(sbi->stop_reason, raw_super->s_stop_reason, MAX_STOP_REASON);
@@ -4547,12 +4586,27 @@ try_onemore:
 	if (err)
 		goto free_xattr_cache;
 
+	/* PiDirManager: the in-memory Inode-to-PID table */
+	sbi->pidir_table = kvcalloc(F2FS_PIDIR_TABLE_ENTRIES,
+				    sizeof(*sbi->pidir_table), GFP_KERNEL);
+	if (!sbi->pidir_table) {
+		err = -ENOMEM;
+		goto free_page_array_cache;
+	}
+
+	/*
+	 * PiDir-FS is enabled when mkfs.f2fs (f2fs-tools-fdp) created the
+	 * Initial P-Directories, which it marks with -O lost_found. Without
+	 * them this is the KernelFDP-F2FS baseline (temperature-based PIDs).
+	 */
+	sbi->pidir_enabled = f2fs_sb_has_lost_found(sbi);
+
 	/* get an inode for meta space */
 	sbi->meta_inode = f2fs_iget(sb, F2FS_META_INO(sbi));
 	if (IS_ERR(sbi->meta_inode)) {
 		f2fs_err(sbi, "Failed to read F2FS meta data inode");
 		err = PTR_ERR(sbi->meta_inode);
-		goto free_page_array_cache;
+		goto free_pidir_table;
 	}
 
 	err = f2fs_get_valid_checkpoint(sbi);
@@ -4861,6 +4915,9 @@ free_meta_inode:
 	make_bad_inode(sbi->meta_inode);
 	iput(sbi->meta_inode);
 	sbi->meta_inode = NULL;
+free_pidir_table:
+	kvfree(sbi->pidir_table);
+	sbi->pidir_table = NULL;
 free_page_array_cache:
 	f2fs_destroy_page_array_cache(sbi);
 free_xattr_cache:
@@ -4872,8 +4929,7 @@ free_percpu:
 free_iostat:
 	f2fs_destroy_iostat(sbi);
 free_bio_info:
-	for (i = 0; i < NR_PAGE_TYPE; i++)
-		kvfree(sbi->write_io[i]);
+	f2fs_destroy_write_merge_io(sbi);
 
 #if IS_ENABLED(CONFIG_UNICODE)
 	utf8_unload(sb->s_encoding);

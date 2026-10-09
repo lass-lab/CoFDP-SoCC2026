@@ -39,6 +39,7 @@
 #include "xfs_ioctl.h"
 #include "xfs_xattr.h"
 #include "xfs_rtbitmap.h"
+#include "xfs_cofdp.h"
 
 #include <linux/mount.h>
 #include <linux/namei.h>
@@ -2159,6 +2160,9 @@ xfs_file_ioctl(
 		sb_end_write(mp->m_super);
 		return error;
 	}
+
+	case XFS_IOC_COFDP_REMAP:
+		return xfs_ioc_cofdp_remap(filp, arg);
 
 	default:
 		return -ENOTTY;

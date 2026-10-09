@@ -804,6 +804,17 @@ struct xfs_scrub_metadata {
 #define XFS_IOC_AG_GEOMETRY	_IOWR('X', 61, struct xfs_ag_geometry)
 
 /*
+ * CoFDP fp-remap: map a directory and everything below it to the PIDs set in
+ * new_pid_bitmap (bit i selects PID i), which makes the directory a Flexible
+ * P-Directory.  Requires CAP_SYS_ADMIN.
+ */
+struct xfs_cofdp_remap_arg {
+	__u32	new_pid_bitmap;		/* PIDs to map, at least one */
+	__u32	flags;			/* reserved, must be 0 */
+};
+#define XFS_IOC_COFDP_REMAP	_IOW ('X', 62, struct xfs_cofdp_remap_arg)
+
+/*
  * ioctl commands that replace IRIX syssgi()'s
  */
 #define XFS_IOC_FSGEOMETRY_V1	     _IOR ('X', 100, struct xfs_fsop_geom_v1)

@@ -175,8 +175,23 @@ typedef struct xfs_sb {
 	xfs_lsn_t	sb_lsn;		/* last write sequence */
 	uuid_t		sb_meta_uuid;	/* metadata file system unique id */
 
+	/*
+	 * CoFDP: number of FDP placement IDs used by PiDir-FS, 0 if disabled.
+	 * In-core only, read from byte XFS_SB_FDP_PIDS_OFF of the superblock.
+	 */
+	uint8_t		sb_fdp_pids;
+
 	/* must be padded to 64 bit alignment */
 } xfs_sb_t;
+
+/*
+ * CoFDP: byte offset of the PID count that "mkfs.xfs -d fdp_pids=N" writes
+ * into the superblock (sb_fdp_pids, the byte after sb_rgblklog in the xfsprogs
+ * on-disk superblock).  It lies beyond the end of struct xfs_dsb but within
+ * the superblock sector, and is zero on file systems without PiDir-FS.
+ * NOTE: no feature bit protects it, see KNOWN_ISSUES (XFS-10).
+ */
+#define XFS_SB_FDP_PIDS_OFF	281
 
 #define XFS_SB_CRC_OFF		offsetof(struct xfs_sb, sb_crc)
 

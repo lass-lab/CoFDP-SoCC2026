@@ -252,6 +252,14 @@ typedef struct xfs_mount {
 
 	/* cpus that have inodes queued for inactivation */
 	struct cpumask		m_inodegc_cpumask;
+
+	/*
+	 * CoFDP PISA (PID-aware space allocator): the AG assigned to each PID,
+	 * see xfs_cofdp_pisa_select_ag().  The allocator does not consume the
+	 * assignment yet.
+	 */
+	xfs_agnumber_t		m_pisa_pid_ag[32];
+	spinlock_t		m_pisa_lock;	/* protects m_pisa_pid_ag */
 } xfs_mount_t;
 
 #define M_IGEO(mp)		(&(mp)->m_ino_geo)

@@ -1031,6 +1031,9 @@ xfs_create(
 	if (error)
 		goto out_trans_cancel;
 
+	/* CoFDP: inherit PID bitmap from parent directory */
+	ip->i_pid_bitmap = xfs_get_initial_pid(dp);
+
 	/*
 	 * Now we join the directory inode to the transaction.  We do not do it
 	 * earlier because xfs_dialloc might commit the previous transaction

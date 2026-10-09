@@ -19,11 +19,13 @@
 #include "xfs_reflink.h"
 #include "xfs_errortag.h"
 #include "xfs_error.h"
+#include "xfs_cofdp.h"
 
 struct xfs_writepage_ctx {
 	struct iomap_writepage_ctx ctx;
 	unsigned int		data_seq;
 	unsigned int		cow_seq;
+	uint32_t		pid_bitmap;	/* CoFDP: PID bits of iomap */
 };
 
 static inline struct xfs_writepage_ctx *
@@ -230,6 +232,14 @@ xfs_imap_valid(
 				XFS_WPC(wpc)->cow_seq, XFS_COW_FORK);
 		return false;
 	}
+
+	/*
+	 * CoFDP: if fp-remap changed the PID bits of the inode, look up a new
+	 * mapping so that its bios are tagged with one of the new PIDs.
+	 */
+	if (XFS_WPC(wpc)->pid_bitmap != READ_ONCE(ip->i_pid_bitmap))
+		return false;
+
 	return true;
 }
 
@@ -383,6 +393,8 @@ retry:
 		goto allocate_blocks;
 
 	xfs_bmbt_to_iomap(ip, &wpc->iomap, &imap, 0, 0, XFS_WPC(wpc)->data_seq);
+	xfs_cofdp_tag_iomap(ip, &wpc->iomap);
+	XFS_WPC(wpc)->pid_bitmap = READ_ONCE(ip->i_pid_bitmap);
 	trace_xfs_map_blocks_found(ip, offset, count, whichfork, &imap);
 	return 0;
 allocate_blocks:
@@ -415,6 +427,7 @@ allocate_blocks:
 
 	ASSERT(wpc->iomap.offset <= offset);
 	ASSERT(wpc->iomap.offset + wpc->iomap.length > offset);
+	XFS_WPC(wpc)->pid_bitmap = READ_ONCE(ip->i_pid_bitmap);
 	trace_xfs_map_blocks_alloc(ip, offset, count, whichfork, &imap);
 	return 0;
 }
@@ -440,6 +453,8 @@ xfs_prepare_ioend(
 	}
 
 	memalloc_nofs_restore(nofs_flag);
+
+	xfs_cofdp_tag_ioend(ioend);
 
 	/* send ioends that might require a transaction to the completion wq */
 	if (xfs_ioend_is_append(ioend) || ioend->io_type == IOMAP_UNWRITTEN ||

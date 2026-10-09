@@ -36,34 +36,6 @@ static inline void sanity_check_seg_type(struct f2fs_sb_info *sbi,
 #define IS_WARM(t)	((t) == CURSEG_WARM_NODE || (t) == CURSEG_WARM_DATA)
 #define IS_COLD(t)	((t) == CURSEG_COLD_NODE || (t) == CURSEG_COLD_DATA)
 
-#define IS_CURSEG(sbi, seg)						\
-	(((seg) == CURSEG_I(sbi, CURSEG_HOT_DATA)->segno) ||	\
-	 ((seg) == CURSEG_I(sbi, CURSEG_WARM_DATA)->segno) ||	\
-	 ((seg) == CURSEG_I(sbi, CURSEG_COLD_DATA)->segno) ||	\
-	 ((seg) == CURSEG_I(sbi, CURSEG_HOT_NODE)->segno) ||	\
-	 ((seg) == CURSEG_I(sbi, CURSEG_WARM_NODE)->segno) ||	\
-	 ((seg) == CURSEG_I(sbi, CURSEG_COLD_NODE)->segno) ||	\
-	 ((seg) == CURSEG_I(sbi, CURSEG_COLD_DATA_PINNED)->segno) ||	\
-	 ((seg) == CURSEG_I(sbi, CURSEG_ALL_DATA_ATGC)->segno))
-
-#define IS_CURSEC(sbi, secno)						\
-	(((secno) == CURSEG_I(sbi, CURSEG_HOT_DATA)->segno /		\
-	  (sbi)->segs_per_sec) ||	\
-	 ((secno) == CURSEG_I(sbi, CURSEG_WARM_DATA)->segno /		\
-	  (sbi)->segs_per_sec) ||	\
-	 ((secno) == CURSEG_I(sbi, CURSEG_COLD_DATA)->segno /		\
-	  (sbi)->segs_per_sec) ||	\
-	 ((secno) == CURSEG_I(sbi, CURSEG_HOT_NODE)->segno /		\
-	  (sbi)->segs_per_sec) ||	\
-	 ((secno) == CURSEG_I(sbi, CURSEG_WARM_NODE)->segno /		\
-	  (sbi)->segs_per_sec) ||	\
-	 ((secno) == CURSEG_I(sbi, CURSEG_COLD_NODE)->segno /		\
-	  (sbi)->segs_per_sec) ||	\
-	 ((secno) == CURSEG_I(sbi, CURSEG_COLD_DATA_PINNED)->segno /	\
-	  (sbi)->segs_per_sec) ||	\
-	 ((secno) == CURSEG_I(sbi, CURSEG_ALL_DATA_ATGC)->segno /	\
-	  (sbi)->segs_per_sec))
-
 #define MAIN_BLKADDR(sbi)						\
 	(SM_I(sbi) ? SM_I(sbi)->main_blkaddr : 				\
 		le32_to_cpu(F2FS_RAW_SUPER(sbi)->main_blkaddr))
@@ -237,6 +209,7 @@ struct sit_info {
 	block_t sit_base_addr;		/* start block address of SIT area */
 	block_t sit_blocks;		/* # of blocks used by SIT area */
 	block_t written_valid_blocks;	/* # of valid blocks in main area */
+	block_t invalidated_blocks;	/* CoFDP stats: # of overwritten blocks */
 	char *bitmap;			/* all bitmaps pointer */
 	char *sit_bitmap;		/* SIT bitmap pointer */
 #ifdef CONFIG_F2FS_CHECK_FS
@@ -326,7 +299,41 @@ struct sit_entry_set {
  */
 static inline struct curseg_info *CURSEG_I(struct f2fs_sb_info *sbi, int type)
 {
-	return (struct curseg_info *)(SM_I(sbi)->curseg_array + type);
+	return SM_I(sbi)->curseg_array[type];
+}
+
+/*
+ * PISA keeps sbi->pid_logs[type] logs per curseg type. CURSEG_I() is log 0,
+ * the only one that checkpoint, summary journals and roll-forward recovery
+ * work with.
+ */
+static inline struct curseg_info *CURSEG_PID_I(struct f2fs_sb_info *sbi,
+						int type, int pid_log)
+{
+	return SM_I(sbi)->curseg_array[type] + pid_log;
+}
+
+static inline bool IS_CURSEG(struct f2fs_sb_info *sbi, unsigned int segno)
+{
+	int i, j;
+
+	for (i = 0; i < NO_CHECK_TYPE; i++)
+		for (j = 0; j < sbi->pid_logs[i]; j++)
+			if (CURSEG_PID_I(sbi, i, j)->segno == segno)
+				return true;
+	return false;
+}
+
+static inline bool IS_CURSEC(struct f2fs_sb_info *sbi, unsigned int secno)
+{
+	int i, j;
+
+	for (i = 0; i < NO_CHECK_TYPE; i++)
+		for (j = 0; j < sbi->pid_logs[i]; j++)
+			if (CURSEG_PID_I(sbi, i, j)->segno /
+					sbi->segs_per_sec == secno)
+				return true;
+	return false;
 }
 
 static inline struct seg_entry *get_seg_entry(struct f2fs_sb_info *sbi,
@@ -963,8 +970,11 @@ static inline void wake_up_discard_thread(struct f2fs_sb_info *sbi, bool force)
 		}
 	}
 	mutex_unlock(&dcc->cmd_lock);
-	if (!wakeup || !is_idle(sbi, DISCARD_TIME))
-		return;
+	/*
+	 * CoFDP: unlike upstream, do not return here when no pending command
+	 * reaches the discard granularity or the device is busy; always wake
+	 * the discard thread so that freed blocks are trimmed promptly.
+	 */
 wake_up:
 	dcc->discard_wake = true;
 	wake_up_interruptible_all(&dcc->discard_wait_queue);

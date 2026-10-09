@@ -54,10 +54,19 @@
  * 16 logs by default. The number, 16, is expected to cover all the cases
  * enoughly. The implementaion currently uses no more than 6 logs.
  * Half the logs are used for nodes, and the other half are used for data.
+ *
+ * CoFDP (PiDir-FS) raises the limit to 128 logs (64 node + 64 data) so that
+ * the checkpoint can describe one log per placement ID for every node and
+ * data temperature: per-PID log j of temperature t (HOT/WARM/COLD) uses
+ * slot 3 * j + t of cur_{node,data}_{segno,blkoff}[], which allows up to
+ * 64 / 3 = 21 per-PID logs. This changes the size and layout of
+ * struct f2fs_checkpoint and is an on-disk format contract with mkfs.f2fs
+ * of f2fs-tools-fdp, which must use the same three values; checkpoints
+ * written by stock F2FS tools are not compatible with this kernel.
  */
-#define MAX_ACTIVE_LOGS	16
-#define MAX_ACTIVE_NODE_LOGS	8
-#define MAX_ACTIVE_DATA_LOGS	8
+#define MAX_ACTIVE_LOGS	128
+#define MAX_ACTIVE_NODE_LOGS	64
+#define MAX_ACTIVE_DATA_LOGS	64
 
 #define VERSION_LEN	256
 #define MAX_VOLUME_NAME		512

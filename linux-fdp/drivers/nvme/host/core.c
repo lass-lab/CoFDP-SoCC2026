@@ -913,6 +913,13 @@ static inline blk_status_t nvme_setup_rw(struct nvme_ns *ns,
 	cmnd->rw.metadata = 0;
 	cmnd->rw.slba = cpu_to_le64(nvme_sect_to_lba(ns, blk_rq_pos(req)));
 	cmnd->rw.length = cpu_to_le16((blk_rq_bytes(req) >> ns->lba_shift) - 1);
+	/*
+	 * CoFDP: pass the FDP placement ID in DSPEC (CDW13[31:16]).  NOTE:
+	 * DTYPE is left 0, so only devices that honour DSPEC without
+	 * DTYPE = 2 (Data Placement), such as FEMU, place data by PID; see
+	 * KNOWN_ISSUES (BLK-2).
+	 */
+	cmnd->rw.dspec = cpu_to_le16(req->fdp_pid);
 	cmnd->rw.reftag = 0;
 	cmnd->rw.apptag = 0;
 	cmnd->rw.appmask = 0;
@@ -946,7 +953,12 @@ static inline blk_status_t nvme_setup_rw(struct nvme_ns *ns,
 	}
 
 	cmnd->rw.control = cpu_to_le16(control);
-	cmnd->rw.dsmgmt = cpu_to_le32(dsmgmt);
+	/*
+	 * CoFDP: do not overwrite DSPEC for writes.  NOTE: this also leaves
+	 * CDW13[15:0] (DSM) of writes unwritten; see KNOWN_ISSUES (BLK-3).
+	 */
+	if (op != nvme_cmd_write)
+		cmnd->rw.dsmgmt = cpu_to_le32(dsmgmt);
 	return 0;
 }
 

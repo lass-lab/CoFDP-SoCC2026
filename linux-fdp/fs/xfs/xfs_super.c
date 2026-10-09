@@ -44,6 +44,7 @@
 #include "xfs_dahash_test.h"
 #include "xfs_rtbitmap.h"
 #include "scrub/stats.h"
+#include "xfs_cofdp.h"
 
 #include <linux/magic.h>
 #include <linux/fs_context.h>
@@ -1743,6 +1744,10 @@ xfs_fs_fill_super(
 		goto out_filestream_unmount;
 	}
 
+	error = xfs_cofdp_mount(mp);
+	if (error)
+		goto out_filestream_unmount;
+
 	error = xfs_mountfs(mp);
 	if (error)
 		goto out_filestream_unmount;
@@ -1757,6 +1762,14 @@ xfs_fs_fill_super(
 		error = -ENOMEM;
 		goto out_unmount;
 	}
+
+	/*
+	 * CoFDP: create the Initial P-Directories through the VFS now that the
+	 * root dentry exists.  This cannot fail the mount: nothing may jump to
+	 * out_unmount once sb->s_root is set.
+	 */
+	if (!sb_rdonly(sb) && xfs_cofdp_enabled(mp))
+		xfs_cofdp_create_initial_pdirs(mp);
 
 	return 0;
 

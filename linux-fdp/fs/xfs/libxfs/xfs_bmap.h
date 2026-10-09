@@ -41,6 +41,7 @@ struct xfs_bmalloca {
 	bool			conv;	/* overwriting unwritten extents */
 	int			datatype;/* data type being allocated */
 	uint32_t		flags;
+	int			fdp_pid;/* CoFDP: PID selected by PISA */
 };
 
 #define	XFS_BMAP_MAX_NMAP	4

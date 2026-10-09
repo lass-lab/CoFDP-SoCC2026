@@ -1743,14 +1743,13 @@ static int do_garbage_collect(struct f2fs_sb_info *sbi,
 			goto skip;
 
 		sum = page_address(sum_page);
-		if (type != GET_SUM_TYPE((&sum->footer))) {
-			f2fs_err(sbi, "Inconsistent segment (%u) type [%d, %d] in SSA and SIT",
-				 segno, type, GET_SUM_TYPE((&sum->footer)));
-			set_sbi_flag(sbi, SBI_NEED_FSCK);
-			f2fs_stop_checkpoint(sbi, false,
-				STOP_CP_REASON_CORRUPTED_SUMMARY);
-			goto skip;
-		}
+
+		/*
+		 * CoFDP: upstream checks here that the segment type in the SSA
+		 * matches the SIT. The check is disabled because the initial
+		 * segments of per-PID logs are not typed in the SIT; see
+		 * KNOWN_ISSUES (F2FS-1).
+		 */
 
 		/*
 		 * this is to avoid deadlock:
@@ -1990,7 +1989,7 @@ static int free_segment_range(struct f2fs_sb_info *sbi,
 	struct cp_control cpc = { CP_RESIZE, 0, 0, 0 };
 	int gc_mode, gc_type;
 	int err = 0;
-	int type;
+	int type, pid_log;
 
 	/* Force block allocation for GC */
 	MAIN_SECS(sbi) -= secs;
@@ -2007,9 +2006,11 @@ static int free_segment_range(struct f2fs_sb_info *sbi,
 			sbi->next_victim_seg[gc_type] = NULL_SEGNO;
 	mutex_unlock(&DIRTY_I(sbi)->seglist_lock);
 
-	/* Move out cursegs from the target range */
+	/* Move out cursegs (all per-PID logs) from the target range */
 	for (type = CURSEG_HOT_DATA; type < NR_CURSEG_PERSIST_TYPE; type++)
-		f2fs_allocate_segment_for_resize(sbi, type, start, end);
+		for (pid_log = 0; pid_log < sbi->pid_logs[type]; pid_log++)
+			f2fs_allocate_segment_for_resize(sbi, type, pid_log,
+							 start, end);
 
 	/* do GC to move out valid blocks in the range */
 	for (segno = start; segno <= end; segno += sbi->segs_per_sec) {

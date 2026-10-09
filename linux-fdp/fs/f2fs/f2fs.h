@@ -24,6 +24,7 @@
 #include <linux/blkdev.h>
 #include <linux/quotaops.h>
 #include <linux/part_stat.h>
+#include <linux/cofdp.h>
 #include <crypto/hash.h>
 
 #include <linux/fscrypt.h>
@@ -114,6 +115,22 @@ extern const char *f2fs_fault_name[FAULT_MAX];
 #define set_opt(sbi, option)	(F2FS_OPTION(sbi).opt |= F2FS_MOUNT_##option)
 #define test_opt(sbi, option)	(F2FS_OPTION(sbi).opt & F2FS_MOUNT_##option)
 
+/*
+ * CoFDP PiDir-FS.
+ *
+ * The PiDirManager keeps the PID bits of every inode (see <linux/cofdp.h>)
+ * in an in-memory Inode-to-PID table indexed by inode number, and persists
+ * them in the inode's i_generation field (the PinodeBlock).
+ *
+ * PISA (PID-aware space allocator) gives each persistent curseg type
+ * (HOT/WARM/COLD x DATA/NODE) one log per PID, so that blocks written with
+ * the same PID get adjacent block addresses. The number of per-PID logs is
+ * set with the fdp_log_n mount option and is bounded by the per-PID slots
+ * of the checkpoint (see MAX_ACTIVE_LOGS in <linux/f2fs_fs.h>).
+ */
+#define F2FS_PIDIR_TABLE_ENTRIES	(1 << 20)
+#define F2FS_MAX_PID_LOGS		(MAX_ACTIVE_DATA_LOGS / NR_CURSEG_DATA_TYPE)
+
 #define ver_after(a, b)	(typecheck(unsigned long long, a) &&		\
 		typecheck(unsigned long long, b) &&			\
 		((long long)((a) - (b)) > 0))
@@ -168,6 +185,7 @@ struct f2fs_mount_info {
 					 * be aligned to this unit: block,
 					 * segment or section
 					 */
+	int nr_pid_logs;		/* fdp_log_n: per-PID logs per type */
 	struct fscrypt_dummy_policy dummy_enc_policy; /* test dummy encryption */
 	block_t unusable_cap_perc;	/* percentage for cap */
 	block_t unusable_cap;		/* Amount of space allowed to be
@@ -229,10 +247,16 @@ enum {
 #define CP_PAUSE	0x00000040
 #define CP_RESIZE 	0x00000080
 
-#define DEF_MAX_DISCARD_REQUEST		8	/* issue 8 discards per round */
-#define DEF_MIN_DISCARD_ISSUE_TIME	50	/* 50 ms, if exists */
-#define DEF_MID_DISCARD_ISSUE_TIME	500	/* 500 ms, if device busy */
-#define DEF_MAX_DISCARD_ISSUE_TIME	60000	/* 60 s, if no candidates */
+/*
+ * CoFDP discard tuning: issue many discards per round and poll for new
+ * candidates aggressively. issue_discard_thread() converts the issue
+ * intervals with usecs_to_jiffies(), so they are in microseconds (upstream
+ * uses milliseconds); the *_discard_issue_time sysfs knobs use the same unit.
+ */
+#define DEF_MAX_DISCARD_REQUEST		10240	/* issue 10240 discards per round */
+#define DEF_MIN_DISCARD_ISSUE_TIME	1	/* 1 us, if exists */
+#define DEF_MID_DISCARD_ISSUE_TIME	1	/* 1 us, if device busy */
+#define DEF_MAX_DISCARD_ISSUE_TIME	60000	/* 60 ms, if no candidates */
 #define DEF_DISCARD_URGENT_UTIL		80	/* do more discard over 80% */
 #define DEF_CP_INTERVAL			60	/* 60 secs */
 #define DEF_IDLE_INTERVAL		5	/* 5 secs */
@@ -1033,7 +1057,7 @@ struct f2fs_sm_info {
 	struct sit_info *sit_info;		/* whole segment information */
 	struct free_segmap_info *free_info;	/* free segment information */
 	struct dirty_seglist_info *dirty_info;	/* dirty segment information */
-	struct curseg_info *curseg_array;	/* active segment information */
+	struct curseg_info **curseg_array;	/* [type][pid_log] active logs */
 
 	struct f2fs_rwsem curseg_lock;	/* for preventing curseg change */
 
@@ -1206,6 +1230,7 @@ struct f2fs_io_info {
 	struct writeback_control *io_wbc; /* writeback control */
 	struct bio **bio;		/* bio for ipu */
 	sector_t *last_block;		/* last block number in bio */
+	u32 fdp_pid;			/* CoFDP: per-PID log (PISA) of the I/O */
 };
 
 struct bio_entry {
@@ -1556,7 +1581,7 @@ struct f2fs_sb_info {
 	struct f2fs_sm_info *sm_info;		/* segment manager */
 
 	/* for bio operations */
-	struct f2fs_bio_info *write_io[NR_PAGE_TYPE];	/* for write bios */
+	struct f2fs_bio_info **write_io[NR_PAGE_TYPE];	/* [temp][pid_log] write bios */
 	/* keep migration IO order for LFS mode */
 	struct f2fs_rwsem io_order_lock;
 	mempool_t *write_io_dummy;		/* Dummy pages */
@@ -1803,6 +1828,32 @@ struct f2fs_sb_info {
 	spinlock_t iostat_lat_lock;
 	struct iostat_lat_info *iostat_io_lat;
 #endif
+
+	/* CoFDP PiDir-FS */
+	bool pidir_enabled;			/* PiDir mode (see f2fs_fill_super) */
+	u32 *pidir_table;			/* Inode-to-PID table */
+	uint64_t pid_logs[NR_CURSEG_TYPE];	/*
+						 * # of per-PID logs of each curseg
+						 * type; keep it 64-bit, the PISA
+						 * modulo depends on it
+						 */
+
+	/*
+	 * CoFDP statistics, printed once per second by the stats thread
+	 * (segment.c). Write counters are indexed [page type][temperature]
+	 * [per-PID log]; a row holds 8 logs, so with fdp_log_n > 8 the
+	 * counters of adjacent temperatures overlap. See KNOWN_ISSUES
+	 * (F2FS-14).
+	 */
+	struct task_struct *cofdp_stat_task;
+	uint64_t fdp_pid_merge_try_stat[16];
+	uint64_t fdp_pid_nomerge_stat[16];
+	uint64_t total_bio_submit_n[3][6][8];
+	uint64_t total_bio_submit_bytes[3][6][8];
+	uint64_t total_read_bio_submit_n;
+	uint64_t total_read_bio_submit_bytes;
+	uint64_t discarded_size;
+	uint64_t discarded_created_n[MAX_PLIST_NUM];
 };
 
 #ifdef CONFIG_F2FS_FAULT_INJECTION
@@ -2588,6 +2639,55 @@ static inline void __set_cp_next_pack(struct f2fs_sb_info *sbi)
 static inline block_t __start_sum_addr(struct f2fs_sb_info *sbi)
 {
 	return le32_to_cpu(F2FS_CKPT(sbi)->cp_pack_start_sum);
+}
+
+/* PISA: merged-write bio of a page type, temperature and per-PID log */
+static inline struct f2fs_bio_info *F2FS_WRITE_IO(struct f2fs_sb_info *sbi,
+		enum page_type btype, enum temp_type temp, int pid_log)
+{
+	return &sbi->write_io[btype][temp][pid_log];
+}
+
+/*
+ * PiDirManager: accessors of the Inode-to-PID table. Inode numbers beyond
+ * the table read as PID bits 0 and are not recorded.
+ */
+static inline u32 f2fs_pidir_get(struct f2fs_sb_info *sbi, nid_t ino)
+{
+	if (unlikely(ino >= F2FS_PIDIR_TABLE_ENTRIES))
+		return 0;
+	return READ_ONCE(sbi->pidir_table[ino]);
+}
+
+static inline void f2fs_pidir_set(struct f2fs_sb_info *sbi, nid_t ino,
+				  u32 pid_bits)
+{
+	if (likely(ino < F2FS_PIDIR_TABLE_ENTRIES))
+		WRITE_ONCE(sbi->pidir_table[ino], pid_bits);
+}
+
+/*
+ * Pick one PID of a Flexible P-Directory bitmap with get_random_bytes(),
+ * which spreads concurrent writers over the mapped PIDs at negligible cost.
+ * Returns -1 for an empty bitmap.
+ */
+static inline int f2fs_pidir_random_pid(u32 bitmap)
+{
+	u32 nr_pids = hweight32(bitmap);
+	u32 r;
+	int pid;
+
+	if (!nr_pids)
+		return -1;
+
+	get_random_bytes(&r, sizeof(r));
+	r %= nr_pids;
+
+	/* the r-th set bit; r < nr_pids, so the loop always finds one */
+	for (pid = 0; pid < 32; pid++)
+		if ((bitmap & BIT(pid)) && r-- == 0)
+			break;
+	return pid;
 }
 
 extern void f2fs_mark_inode_dirty_sync(struct inode *inode, bool sync);
@@ -3684,7 +3784,7 @@ void f2fs_restore_inmem_curseg(struct f2fs_sb_info *sbi);
 void f2fs_get_new_segment(struct f2fs_sb_info *sbi,
 			unsigned int *newseg, bool new_sec, int dir);
 void f2fs_allocate_segment_for_resize(struct f2fs_sb_info *sbi, int type,
-					unsigned int start, unsigned int end);
+			int pid_log, unsigned int start, unsigned int end);
 void f2fs_allocate_new_section(struct f2fs_sb_info *sbi, int type, bool force);
 void f2fs_allocate_new_segments(struct f2fs_sb_info *sbi);
 int f2fs_trim_fs(struct f2fs_sb_info *sbi, struct fstrim_range *range);
@@ -3730,6 +3830,7 @@ void f2fs_destroy_segment_manager(struct f2fs_sb_info *sbi);
 int __init f2fs_create_segment_manager_caches(void);
 void f2fs_destroy_segment_manager_caches(void);
 int f2fs_rw_hint_to_seg_type(enum rw_hint hint);
+int f2fs_pisa_log(struct f2fs_sb_info *sbi, int type, nid_t ino);
 unsigned int f2fs_usable_segs_in_sec(struct f2fs_sb_info *sbi,
 			unsigned int segno);
 unsigned int f2fs_usable_blks_in_seg(struct f2fs_sb_info *sbi,
@@ -3802,6 +3903,7 @@ void f2fs_destroy_bio_entry_cache(void);
 void f2fs_submit_read_bio(struct f2fs_sb_info *sbi, struct bio *bio,
 			  enum page_type type);
 int f2fs_init_write_merge_io(struct f2fs_sb_info *sbi);
+void f2fs_destroy_write_merge_io(struct f2fs_sb_info *sbi);
 void f2fs_submit_merged_write(struct f2fs_sb_info *sbi, enum page_type type);
 void f2fs_submit_merged_write_cond(struct f2fs_sb_info *sbi,
 				struct inode *inode, struct page *page,

@@ -675,6 +675,9 @@ __xfs_sb_from_disk(
 	/* Convert on-disk flags to in-memory flags? */
 	if (convert_xquota)
 		xfs_sb_quota_from_disk(to);
+
+	/* CoFDP: the PID count lies beyond the end of struct xfs_dsb. */
+	to->sb_fdp_pids = ((uint8_t *)from)[XFS_SB_FDP_PIDS_OFF];
 }
 
 void

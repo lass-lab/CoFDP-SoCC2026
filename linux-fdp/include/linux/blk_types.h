@@ -276,6 +276,16 @@ struct bio {
 
 	struct bvec_iter	bi_iter;
 
+	/*
+	 * CoFDP: FDP placement ID (PID), set by the submitter.  Copied by
+	 * __bio_clone() (clones, splits), bounce_clone_bio(),
+	 * blk_crypto_fallback_clone_bio() and into the request; I/Os with
+	 * different PIDs are never merged; NVMe writes carry it in DSPEC.
+	 * bio_reset() clears it (it lies within BIO_RESET_BYTES), bio_init()
+	 * does not: see KNOWN_ISSUES (BLK-1).
+	 */
+	unsigned int		fdp_pid;
+
 	blk_qc_t		bi_cookie;
 	bio_end_io_t		*bi_end_io;
 	void			*bi_private;

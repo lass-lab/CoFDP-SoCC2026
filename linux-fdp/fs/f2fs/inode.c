@@ -424,6 +424,8 @@ static int do_read_inode(struct inode *inode)
 	inode_set_mtime(inode, le64_to_cpu(ri->i_mtime),
 			le32_to_cpu(ri->i_mtime_nsec));
 	inode->i_generation = le32_to_cpu(ri->i_generation);
+	/* PiDir-FS: load the PID bits of the PinodeBlock into the table */
+	f2fs_pidir_set(sbi, inode->i_ino, inode->i_generation);
 	if (S_ISDIR(inode->i_mode))
 		fi->i_current_depth = le32_to_cpu(ri->i_current_depth);
 	else if (S_ISREG(inode->i_mode))
@@ -714,6 +716,8 @@ void f2fs_update_inode(struct inode *inode, struct page *node_page)
 	ri->i_flags = cpu_to_le32(F2FS_I(inode)->i_flags);
 	ri->i_pino = cpu_to_le32(F2FS_I(inode)->i_pino);
 	ri->i_generation = cpu_to_le32(inode->i_generation);
+	/* PiDir-FS: the PinodeBlock and the table entry stay in sync */
+	f2fs_pidir_set(F2FS_I_SB(inode), inode->i_ino, inode->i_generation);
 	ri->i_dir_level = F2FS_I(inode)->i_dir_level;
 
 	if (f2fs_has_extra_attr(inode)) {

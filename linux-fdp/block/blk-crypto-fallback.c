@@ -174,6 +174,7 @@ static struct bio *blk_crypto_fallback_clone_bio(struct bio *bio_src)
 	bio->bi_ioprio		= bio_src->bi_ioprio;
 	bio->bi_iter.bi_sector	= bio_src->bi_iter.bi_sector;
 	bio->bi_iter.bi_size	= bio_src->bi_iter.bi_size;
+	bio->fdp_pid		= bio_src->fdp_pid;
 
 	bio_for_each_segment(bv, bio_src, iter)
 		bio->bi_io_vec[bio->bi_vcnt++] = bv;

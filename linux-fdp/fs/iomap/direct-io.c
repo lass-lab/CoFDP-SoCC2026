@@ -68,6 +68,15 @@ static void iomap_dio_submit_bio(const struct iomap_iter *iter,
 
 	atomic_inc(&dio->ref);
 
+	/*
+	 * CoFDP: tag the bio with the FDP placement ID of the mapping.  NOTE:
+	 * unlike buffered writeback, a PID of 0 is not copied, so the bio
+	 * keeps the stale fdp_pid it was allocated with (bio_init() does not
+	 * clear it); see KNOWN_ISSUES (BLK-4).
+	 */
+	if (iter->iomap.fdp_pid)
+		bio->fdp_pid = iter->iomap.fdp_pid;
+
 	/* Sync dio can't be polled reliably */
 	if ((iocb->ki_flags & IOCB_HIPRI) && !is_sync_kiocb(iocb)) {
 		bio_set_polled(bio, iocb);

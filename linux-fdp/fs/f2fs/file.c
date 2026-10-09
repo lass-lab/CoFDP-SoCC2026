@@ -3309,6 +3309,180 @@ static int f2fs_ioc_resize_fs(struct file *filp, unsigned long arg)
 	return f2fs_resize_fs(filp, block_count);
 }
 
+/*
+ * fp-remap (F2FS_IOC_FP_REMAP): map a directory and everything below it to a
+ * new set of PIDs, i.e. make it a Flexible P-Directory. The PiDirManager
+ * rewrites the PID bits of every inode in the subtree, both in the
+ * Inode-to-PID table, so that new allocations use the new PIDs at once,
+ * and in the PinodeBlock (i_generation), so that the mapping persists.
+ *
+ * NOTE: the walk recurses once per directory level and keeps the i_rwsem
+ * of every directory on the current path; the updated inodes are written
+ * back through regular inode write-back (mark_inode_dirty()). See
+ * KNOWN_ISSUES (F2FS-8, F2FS-9, F2FS-10).
+ */
+static void fp_remap_set_inode_pid(struct f2fs_sb_info *sbi,
+				   struct inode *inode, u32 pid_bits)
+{
+	f2fs_pidir_set(sbi, inode->i_ino, pid_bits);
+	inode->i_generation = pid_bits;
+	mark_inode_dirty(inode);
+}
+
+static int fp_remap_walk_dir(struct f2fs_sb_info *sbi, struct inode *dir,
+			     u32 pid_bits);
+
+/* Remap the entries of one (inline or regular) dentry block. */
+static int fp_remap_walk_dentries(struct f2fs_sb_info *sbi,
+				  struct f2fs_dentry_ptr *d, u32 pid_bits)
+{
+	int bit_pos = 0;
+	int err = 0;
+
+	while (bit_pos < d->max) {
+		struct f2fs_dir_entry *de;
+		struct inode *child;
+		unsigned int name_len;
+		int slots;
+
+		if (!test_bit_le(bit_pos, d->bitmap)) {
+			bit_pos++;
+			continue;
+		}
+
+		de = &d->dentry[bit_pos];
+		name_len = le16_to_cpu(de->name_len);
+
+		/* same sanity checks as f2fs_fill_dentries() */
+		if (!name_len) {
+			bit_pos++;
+			continue;
+		}
+		slots = GET_DENTRY_SLOTS(name_len);
+		if (unlikely(bit_pos + slots > d->max ||
+			     name_len > F2FS_NAME_LEN)) {
+			set_sbi_flag(sbi, SBI_NEED_FSCK);
+			f2fs_handle_error(sbi, ERROR_CORRUPTED_DIRENT);
+			return err ? err : -EFSCORRUPTED;
+		}
+
+		/* skip . and .. */
+		if ((name_len == 1 && d->filename[bit_pos][0] == '.') ||
+		    (name_len == 2 && d->filename[bit_pos][0] == '.' &&
+		     d->filename[bit_pos][1] == '.')) {
+			bit_pos += slots;
+			continue;
+		}
+
+		child = f2fs_iget(sbi->sb, le32_to_cpu(de->ino));
+		if (IS_ERR(child)) {
+			if (!err)
+				err = PTR_ERR(child);
+			bit_pos += slots;
+			continue;
+		}
+
+		fp_remap_set_inode_pid(sbi, child, pid_bits);
+
+		if (S_ISDIR(child->i_mode)) {
+			int ret = fp_remap_walk_dir(sbi, child, pid_bits);
+
+			if (!err)
+				err = ret;
+		}
+
+		iput(child);
+		bit_pos += slots;
+	}
+	return err;
+}
+
+/* Remap everything below @dir; returns the first error, if any. */
+static int fp_remap_walk_dir(struct f2fs_sb_info *sbi, struct inode *dir,
+			     u32 pid_bits)
+{
+	struct f2fs_dentry_ptr d;
+	int err = 0;
+
+	inode_lock(dir);
+
+	if (f2fs_has_inline_dentry(dir)) {
+		struct page *ipage;
+
+		ipage = f2fs_get_node_page(sbi, dir->i_ino);
+		if (IS_ERR(ipage)) {
+			err = PTR_ERR(ipage);
+			goto out;
+		}
+		unlock_page(ipage);
+
+		make_dentry_ptr_inline(dir, &d, inline_data_addr(dir, ipage));
+		err = fp_remap_walk_dentries(sbi, &d, pid_bits);
+		f2fs_put_page(ipage, 0);
+	} else {
+		unsigned long npages = ((unsigned long long)
+			(i_size_read(dir) + PAGE_SIZE - 1)) >> PAGE_SHIFT;
+		unsigned long n;
+
+		for (n = 0; n < npages; n++) {
+			struct page *dentry_page;
+			int ret;
+
+			dentry_page = f2fs_find_data_page(dir, n, NULL);
+			if (IS_ERR(dentry_page)) {
+				ret = PTR_ERR(dentry_page);
+				/* -ENOENT is a hole in the directory */
+				if (ret != -ENOENT && !err)
+					err = ret;
+				continue;
+			}
+
+			make_dentry_ptr_block(dir, &d,
+					page_address(dentry_page));
+			ret = fp_remap_walk_dentries(sbi, &d, pid_bits);
+			if (!err)
+				err = ret;
+			f2fs_put_page(dentry_page, 0);
+		}
+	}
+out:
+	inode_unlock(dir);
+	return err;
+}
+
+static int f2fs_ioc_fp_remap(struct file *filp, unsigned long arg)
+{
+	struct inode *inode = file_inode(filp);
+	struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
+	u32 bitmap, pid_bits;
+	int err;
+
+	if (!capable(CAP_SYS_ADMIN))
+		return -EPERM;
+
+	if (inode->i_op != &f2fs_dir_inode_operations)
+		return -ENOTDIR;
+
+	if (copy_from_user(&bitmap, (u32 __user *)arg, sizeof(bitmap)))
+		return -EFAULT;
+
+	if (!cofdp_pid_bitmap(bitmap))
+		return -EINVAL;
+
+	err = mnt_want_write_file(filp);
+	if (err)
+		return err;
+
+	pid_bits = COFDP_PID_FLEXIBLE | bitmap;
+
+	/* the directory first, so that new files already inherit the PIDs */
+	fp_remap_set_inode_pid(sbi, inode, pid_bits);
+	err = fp_remap_walk_dir(sbi, inode, pid_bits);
+
+	mnt_drop_write_file(filp);
+	return err;
+}
+
 static int f2fs_ioc_enable_verity(struct file *filp, unsigned long arg)
 {
 	struct inode *inode = file_inode(filp);
@@ -3767,9 +3941,12 @@ static int f2fs_secure_erase(struct block_device *bdev, struct inode *inode,
 		if (bdev_max_secure_erase_sectors(bdev))
 			ret = blkdev_issue_secure_erase(bdev, sector, nr_sects,
 					GFP_NOFS);
-		else
+		else {
+			/* CoFDP stats (counted in sectors here) */
+			F2FS_I_SB(inode)->discarded_size += nr_sects;
 			ret = blkdev_issue_discard(bdev, sector, nr_sects,
 					GFP_NOFS);
+		}
 	}
 
 	if (!ret && (flags & F2FS_TRIM_FILE_ZEROOUT)) {
@@ -4314,6 +4491,8 @@ static long __f2fs_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		return f2fs_ioc_decompress_file(filp);
 	case F2FS_IOC_COMPRESS_FILE:
 		return f2fs_ioc_compress_file(filp);
+	case F2FS_IOC_FP_REMAP:
+		return f2fs_ioc_fp_remap(filp, arg);
 	default:
 		return -ENOTTY;
 	}
@@ -4985,6 +5164,7 @@ long f2fs_compat_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	case F2FS_IOC_SET_COMPRESS_OPTION:
 	case F2FS_IOC_DECOMPRESS_FILE:
 	case F2FS_IOC_COMPRESS_FILE:
+	case F2FS_IOC_FP_REMAP:
 		break;
 	default:
 		return -ENOIOCTLCMD;

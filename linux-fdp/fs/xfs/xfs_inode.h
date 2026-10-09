@@ -67,6 +67,7 @@ typedef struct xfs_inode {
 	uint16_t		i_diflags;	/* XFS_DIFLAG_... */
 	uint64_t		i_diflags2;	/* XFS_DIFLAG2_... */
 	struct timespec64	i_crtime;	/* time created */
+	uint32_t		i_pid_bitmap;	/* CoFDP PID bits */
 
 	/*
 	 * Unlinked list pointers.  These point to the next and previous inodes
@@ -271,6 +272,16 @@ xfs_get_initial_prid(struct xfs_inode *dp)
 		return dp->i_projid;
 
 	return XFS_PROJID_DEFAULT;
+}
+
+/*
+ * CoFDP: a new inode inherits the PID bits of its parent directory.  Only
+ * xfs_create() applies this, see KNOWN_ISSUES (XFS-8).
+ */
+static inline uint32_t
+xfs_get_initial_pid(struct xfs_inode *dp)
+{
+	return dp->i_pid_bitmap;
 }
 
 static inline bool xfs_is_reflink_inode(struct xfs_inode *ip)

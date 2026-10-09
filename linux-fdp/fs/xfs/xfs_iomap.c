@@ -27,6 +27,7 @@
 #include "xfs_dquot_item.h"
 #include "xfs_dquot.h"
 #include "xfs_reflink.h"
+#include "xfs_cofdp.h"
 
 #define XFS_ALLOC_ALIGN(mp, off) \
 	(((off) >> mp->m_allocsize_log) << mp->m_allocsize_log)
@@ -770,6 +771,11 @@ imap_spans_range(
 	return true;
 }
 
+/*
+ * CoFDP: the mappings returned here are tagged with a PID of the inode, which
+ * iomap_dio_submit_bio() attaches to the bios of direct I/O.  NOTE: see
+ * KNOWN_ISSUES (XFS-11).
+ */
 static int
 xfs_direct_write_iomap_begin(
 	struct inode		*inode,
@@ -860,7 +866,10 @@ xfs_direct_write_iomap_begin(
 	seq = xfs_iomap_inode_sequence(ip, iomap_flags);
 	xfs_iunlock(ip, lockmode);
 	trace_xfs_iomap_found(ip, offset, length, XFS_DATA_FORK, &imap);
-	return xfs_bmbt_to_iomap(ip, iomap, &imap, flags, iomap_flags, seq);
+	error = xfs_bmbt_to_iomap(ip, iomap, &imap, flags, iomap_flags, seq);
+	if (!error)
+		xfs_cofdp_tag_iomap(ip, iomap);
+	return error;
 
 allocate_blocks:
 	error = -EAGAIN;
@@ -891,8 +900,11 @@ allocate_blocks:
 		return error;
 
 	trace_xfs_iomap_alloc(ip, offset, length, XFS_DATA_FORK, &imap);
-	return xfs_bmbt_to_iomap(ip, iomap, &imap, flags,
-				 iomap_flags | IOMAP_F_NEW, seq);
+	error = xfs_bmbt_to_iomap(ip, iomap, &imap, flags,
+				  iomap_flags | IOMAP_F_NEW, seq);
+	if (!error)
+		xfs_cofdp_tag_iomap(ip, iomap);
+	return error;
 
 out_found_cow:
 	length = XFS_FSB_TO_B(mp, cmap.br_startoff + cmap.br_blockcount);
@@ -905,7 +917,10 @@ out_found_cow:
 	}
 	seq = xfs_iomap_inode_sequence(ip, IOMAP_F_SHARED);
 	xfs_iunlock(ip, lockmode);
-	return xfs_bmbt_to_iomap(ip, iomap, &cmap, flags, IOMAP_F_SHARED, seq);
+	error = xfs_bmbt_to_iomap(ip, iomap, &cmap, flags, IOMAP_F_SHARED, seq);
+	if (!error)
+		xfs_cofdp_tag_iomap(ip, iomap);
+	return error;
 
 out_unlock:
 	if (lockmode)

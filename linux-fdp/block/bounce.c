@@ -171,6 +171,7 @@ static struct bio *bounce_clone_bio(struct bio *bio_src)
 	bio->bi_ioprio		= bio_src->bi_ioprio;
 	bio->bi_iter.bi_sector	= bio_src->bi_iter.bi_sector;
 	bio->bi_iter.bi_size	= bio_src->bi_iter.bi_size;
+	bio->fdp_pid		= bio_src->fdp_pid;
 
 	switch (bio_op(bio)) {
 	case REQ_OP_DISCARD:

@@ -21,6 +21,7 @@
 #include "xfs_errortag.h"
 #include "xfs_error.h"
 #include "xfs_ag.h"
+#include "xfs_cofdp.h"
 
 struct kmem_cache *xfs_buf_cache;
 
@@ -1513,6 +1514,12 @@ next_chunk:
 			flush_kernel_vmap_range(bp->b_addr,
 						xfs_buf_vmap_len(bp));
 		}
+		/*
+		 * CoFDP: metadata is written with PID 0.  Set it explicitly as
+		 * bio_alloc() does not reset the PID of a recycled bio.
+		 */
+		if (xfs_cofdp_enabled(bp->b_mount))
+			bio->fdp_pid = 0;
 		submit_bio(bio);
 		if (size)
 			goto next_chunk;

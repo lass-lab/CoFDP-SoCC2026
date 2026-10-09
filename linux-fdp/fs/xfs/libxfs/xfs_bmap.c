@@ -36,6 +36,7 @@
 #include "xfs_refcount.h"
 #include "xfs_icache.h"
 #include "xfs_iomap.h"
+#include "xfs_cofdp.h"
 
 struct kmem_cache		*xfs_bmap_intent_cache;
 
@@ -3676,6 +3677,39 @@ xfs_bmap_btalloc_best_length(
 	return xfs_bmap_btalloc_low_space(ap, args);
 }
 
+/*
+ * CoFDP PISA (PID-aware space allocator): pick the PID that tags the bios of
+ * the new extent (see xfs_bmapi_convert_delalloc()) and the AG that PISA
+ * assigns to that PID.
+ *
+ * NOTE: the AG chosen by PISA is currently not consumed by the allocator.
+ * xfs_bmap_btalloc_best_length() targets the inode and the neighbouring
+ * extents through ap->blkno, and xfs_alloc_vextent_check_args() resets
+ * args->fsbno before every allocation, so data placement follows stock XFS
+ * locality.  See KNOWN_ISSUES (XFS-1).
+ */
+static int
+xfs_bmap_btalloc_pisa(
+	struct xfs_bmalloca	*ap,
+	struct xfs_alloc_arg	*args,
+	int			stripe_align)
+{
+	struct xfs_mount	*mp = args->mp;
+	unsigned int		pid = xfs_cofdp_pick_pid(ap->ip->i_pid_bitmap);
+	xfs_agnumber_t		agno;
+	int			error;
+
+	ap->fdp_pid = pid;
+
+	agno = xfs_cofdp_pisa_select_ag(mp, pid, args->maxlen);
+	args->fsbno = XFS_AGB_TO_FSB(mp, agno, 0);
+	error = xfs_bmap_btalloc_best_length(ap, args, stripe_align);
+	if (!error && args->fsbno != NULLFSBLOCK)
+		xfs_cofdp_pisa_update_ag(mp, pid, agno,
+				XFS_FSB_TO_AGNO(mp, args->fsbno));
+	return error;
+}
+
 static int
 xfs_bmap_btalloc(
 	struct xfs_bmalloca	*ap)
@@ -3707,7 +3741,10 @@ xfs_bmap_btalloc(
 	/* Trim the allocation back to the maximum an AG can fit. */
 	args.maxlen = min(ap->length, mp->m_ag_max_usable);
 
-	if ((ap->datatype & XFS_ALLOC_USERDATA) &&
+	/* CoFDP: inodes with PID bits allocate via PISA, not filestreams. */
+	if (xfs_cofdp_enabled(mp) && ap->ip->i_pid_bitmap)
+		error = xfs_bmap_btalloc_pisa(ap, &args, stripe_align);
+	else if ((ap->datatype & XFS_ALLOC_USERDATA) &&
 	    xfs_inode_is_filestream(ap->ip))
 		error = xfs_bmap_btalloc_filestreams(ap, &args, stripe_align);
 	else
@@ -4608,6 +4645,11 @@ xfs_bmapi_convert_delalloc(
 	ASSERT(!isnullstartblock(bma.got.br_startblock));
 	xfs_bmbt_to_iomap(ip, iomap, &bma.got, 0, flags,
 				xfs_iomap_inode_sequence(ip, flags));
+	/*
+	 * CoFDP: writeback tags the bios with the PID picked by PISA.  The race
+	 * path above leaves iomap->fdp_pid alone, see KNOWN_ISSUES (XFS-12).
+	 */
+	iomap->fdp_pid = bma.fdp_pid;
 	*seq = READ_ONCE(ifp->if_seq);
 
 	if (whichfork == XFS_COW_FORK)

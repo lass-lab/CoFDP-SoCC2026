@@ -35,7 +35,11 @@ static struct kmem_cache *bio_entry_slab;
 static mempool_t *bio_post_read_ctx_pool;
 static struct bio_set f2fs_bioset;
 
-#define	F2FS_BIO_POOL_SIZE	NR_CURSEG_TYPE
+/*
+ * CoFDP: every per-PID log may hold an open merged-write bio, so reserve
+ * one bio for each of them at the largest fdp_log_n.
+ */
+#define	F2FS_BIO_POOL_SIZE	(NR_CURSEG_TYPE * F2FS_MAX_PID_LOGS)
 
 int __init f2fs_init_bioset(void)
 {
@@ -460,6 +464,29 @@ static blk_opf_t f2fs_io_flags(struct f2fs_io_info *fio)
 	return op_flags;
 }
 
+/*
+ * CoFDP: placement ID that a write bio carries down to the NVMe driver (DSPEC).
+ * In PiDir mode, data and node writes are tagged with the per-PID log that
+ * PISA chose for them. Otherwise (the KernelFDP-F2FS baseline) they are
+ * separated by temperature: DATA HOT/WARM/COLD use PID 1/2/3 and NODE
+ * HOT/WARM/COLD use PID 4/5/6. Other writes use PID 0.
+ */
+static unsigned int f2fs_write_bio_pid(struct f2fs_sb_info *sbi,
+				       struct f2fs_io_info *fio)
+{
+	if (sbi->pidir_enabled) {
+		if (fio->type == DATA || fio->type == NODE)
+			return fio->fdp_pid;
+		return 0;
+	}
+
+	if (fio->type == DATA)
+		return fio->temp + 1;
+	if (fio->type == NODE)
+		return 3 + fio->temp + 1;
+	return 0;
+}
+
 static struct bio *__bio_alloc(struct f2fs_io_info *fio, int npages)
 {
 	struct f2fs_sb_info *sbi = fio->sbi;
@@ -475,9 +502,11 @@ static struct bio *__bio_alloc(struct f2fs_io_info *fio, int npages)
 	if (is_read_io(fio->op)) {
 		bio->bi_end_io = f2fs_read_end_io;
 		bio->bi_private = NULL;
+		bio->fdp_pid = 0;
 	} else {
 		bio->bi_end_io = f2fs_write_end_io;
 		bio->bi_private = sbi;
+		bio->fdp_pid = f2fs_write_bio_pid(sbi, fio);
 	}
 	iostat_alloc_and_bind_ctx(sbi, bio, NULL);
 
@@ -522,6 +551,12 @@ void f2fs_submit_read_bio(struct f2fs_sb_info *sbi, struct bio *bio,
 
 	iostat_update_submit_ctx(bio, type);
 	submit_bio(bio);
+	/*
+	 * CoFDP stats. NOTE: bi_size is read after submission; see
+	 * KNOWN_ISSUES (F2FS-14).
+	 */
+	sbi->total_read_bio_submit_n++;
+	sbi->total_read_bio_submit_bytes += bio->bi_iter.bi_size;
 }
 
 static void f2fs_align_write_bio(struct f2fs_sb_info *sbi, struct bio *bio)
@@ -550,7 +585,7 @@ static void f2fs_align_write_bio(struct f2fs_sb_info *sbi, struct bio *bio)
 }
 
 static void f2fs_submit_write_bio(struct f2fs_sb_info *sbi, struct bio *bio,
-				  enum page_type type)
+				  enum page_type type, enum temp_type temp)
 {
 	WARN_ON_ONCE(is_read_io(bio_op(bio)));
 
@@ -567,6 +602,23 @@ static void f2fs_submit_write_bio(struct f2fs_sb_info *sbi, struct bio *bio,
 			if (type == NODE)
 				set_sbi_flag(sbi, SBI_NEED_CP);
 		}
+
+		/* CoFDP stats, per page type, temperature and per-PID log */
+		if (sbi->pidir_enabled) {
+			u64 pid_log = bio->fdp_pid %
+					sbi->pid_logs[temp + type * 3];
+
+			sbi->total_bio_submit_n[type][temp][pid_log]++;
+			sbi->total_bio_submit_bytes[type][temp][pid_log] +=
+							bio->bi_iter.bi_size;
+		} else {
+			sbi->total_bio_submit_n[type][temp][0]++;
+			sbi->total_bio_submit_bytes[type][temp][0] +=
+							bio->bi_iter.bi_size;
+		}
+	} else {
+		sbi->total_bio_submit_n[META][0][0]++;
+		sbi->total_bio_submit_bytes[META][0][0] += bio->bi_iter.bi_size;
 	}
 
 	trace_f2fs_submit_write_bio(sbi->sb, type, bio);
@@ -586,7 +638,7 @@ static void __submit_merged_bio(struct f2fs_bio_info *io)
 		f2fs_submit_read_bio(io->sbi, io->bio, fio->type);
 	} else {
 		trace_f2fs_prepare_write_bio(io->sbi->sb, fio->type, io->bio);
-		f2fs_submit_write_bio(io->sbi, io->bio, fio->type);
+		f2fs_submit_write_bio(io->sbi, io->bio, fio->type, fio->temp);
 	}
 	io->bio = NULL;
 }
@@ -636,36 +688,68 @@ int f2fs_init_write_merge_io(struct f2fs_sb_info *sbi)
 		int n = (i == META) ? 1 : NR_TEMP_TYPE;
 		int j;
 
-		sbi->write_io[i] = f2fs_kmalloc(sbi,
-				array_size(n, sizeof(struct f2fs_bio_info)),
+		sbi->write_io[i] = f2fs_kzalloc(sbi,
+				array_size(n, sizeof(struct f2fs_bio_info *)),
 				GFP_KERNEL);
 		if (!sbi->write_io[i])
 			return -ENOMEM;
 
 		for (j = HOT; j < n; j++) {
-			init_f2fs_rwsem(&sbi->write_io[i][j].io_rwsem);
-			sbi->write_io[i][j].sbi = sbi;
-			sbi->write_io[i][j].bio = NULL;
-			spin_lock_init(&sbi->write_io[i][j].io_lock);
-			INIT_LIST_HEAD(&sbi->write_io[i][j].io_list);
-			INIT_LIST_HEAD(&sbi->write_io[i][j].bio_list);
-			init_f2fs_rwsem(&sbi->write_io[i][j].bio_list_lock);
+			/* PISA: one bio per per-PID log; META has a single one */
+			int nr_logs = (i == META) ? 1 :
+					sbi->pid_logs[i * NR_TEMP_TYPE + j];
+			int k;
+
+			sbi->write_io[i][j] = f2fs_kmalloc(sbi,
+				array_size(nr_logs, sizeof(struct f2fs_bio_info)),
+				GFP_KERNEL);
+			if (!sbi->write_io[i][j])
+				return -ENOMEM;
+
+			for (k = 0; k < nr_logs; k++) {
+				struct f2fs_bio_info *io = &sbi->write_io[i][j][k];
+
+				init_f2fs_rwsem(&io->io_rwsem);
+				io->sbi = sbi;
+				io->bio = NULL;
+				spin_lock_init(&io->io_lock);
+				INIT_LIST_HEAD(&io->io_list);
+				INIT_LIST_HEAD(&io->bio_list);
+				init_f2fs_rwsem(&io->bio_list_lock);
 #ifdef CONFIG_BLK_DEV_ZONED
-			init_completion(&sbi->write_io[i][j].zone_wait);
-			sbi->write_io[i][j].zone_pending_bio = NULL;
-			sbi->write_io[i][j].bi_private = NULL;
+				init_completion(&io->zone_wait);
+				io->zone_pending_bio = NULL;
+				io->bi_private = NULL;
 #endif
+			}
 		}
 	}
 
 	return 0;
 }
 
+void f2fs_destroy_write_merge_io(struct f2fs_sb_info *sbi)
+{
+	int i, j;
+
+	for (i = 0; i < NR_PAGE_TYPE; i++) {
+		int n = (i == META) ? 1 : NR_TEMP_TYPE;
+
+		if (!sbi->write_io[i])
+			continue;
+		for (j = HOT; j < n; j++)
+			kvfree(sbi->write_io[i][j]);
+		kvfree(sbi->write_io[i]);
+		sbi->write_io[i] = NULL;
+	}
+}
+
 static void __f2fs_submit_merged_write(struct f2fs_sb_info *sbi,
-				enum page_type type, enum temp_type temp)
+				enum page_type type, enum temp_type temp,
+				int pid_log)
 {
 	enum page_type btype = PAGE_TYPE_OF_BIO(type);
-	struct f2fs_bio_info *io = sbi->write_io[btype] + temp;
+	struct f2fs_bio_info *io = F2FS_WRITE_IO(sbi, btype, temp, pid_log);
 
 	f2fs_down_write(&io->io_rwsem);
 
@@ -688,24 +772,39 @@ static void __submit_merged_write_cond(struct f2fs_sb_info *sbi,
 				struct inode *inode, struct page *page,
 				nid_t ino, enum page_type type, bool force)
 {
+	enum page_type btype = PAGE_TYPE_OF_BIO(type);
 	enum temp_type temp;
 	bool ret = true;
+	int pid_log;
 
-	for (temp = HOT; temp < NR_TEMP_TYPE; temp++) {
-		if (!force)	{
-			enum page_type btype = PAGE_TYPE_OF_BIO(type);
-			struct f2fs_bio_info *io = sbi->write_io[btype] + temp;
+	/* TODO: use HOT temp only for meta pages now. */
+	if (btype == META) {
+		if (!force) {
+			struct f2fs_bio_info *io = F2FS_WRITE_IO(sbi, META, HOT, 0);
 
 			f2fs_down_read(&io->io_rwsem);
 			ret = __has_merged_page(io->bio, inode, page, ino);
 			f2fs_up_read(&io->io_rwsem);
 		}
 		if (ret)
-			__f2fs_submit_merged_write(sbi, type, temp);
+			__f2fs_submit_merged_write(sbi, type, HOT, 0);
+		return;
+	}
 
-		/* TODO: use HOT temp only for meta pages now. */
-		if (type >= META)
-			break;
+	for (temp = HOT; temp < NR_TEMP_TYPE; temp++) {
+		for (pid_log = 0; pid_log < sbi->pid_logs[btype * NR_TEMP_TYPE + temp];
+		     pid_log++) {
+			if (!force) {
+				struct f2fs_bio_info *io =
+					F2FS_WRITE_IO(sbi, btype, temp, pid_log);
+
+				f2fs_down_read(&io->io_rwsem);
+				ret = __has_merged_page(io->bio, inode, page, ino);
+				f2fs_up_read(&io->io_rwsem);
+			}
+			if (ret)
+				__f2fs_submit_merged_write(sbi, type, temp, pid_log);
+		}
 	}
 }
 
@@ -767,7 +866,7 @@ int f2fs_submit_page_bio(struct f2fs_io_info *fio)
 	if (is_read_io(bio_op(bio)))
 		f2fs_submit_read_bio(fio->sbi, bio, fio->type);
 	else
-		f2fs_submit_write_bio(fio->sbi, bio, fio->type);
+		f2fs_submit_write_bio(fio->sbi, bio, fio->type, fio->temp);
 	return 0;
 }
 
@@ -812,9 +911,9 @@ static bool io_is_mergeable(struct f2fs_sb_info *sbi, struct bio *bio,
 }
 
 static void add_bio_entry(struct f2fs_sb_info *sbi, struct bio *bio,
-				struct page *page, enum temp_type temp)
+			struct page *page, enum temp_type temp, int pid_log)
 {
-	struct f2fs_bio_info *io = sbi->write_io[DATA] + temp;
+	struct f2fs_bio_info *io = F2FS_WRITE_IO(sbi, DATA, temp, pid_log);
 	struct bio_entry *be;
 
 	be = f2fs_kmem_cache_alloc(bio_entry_slab, GFP_NOFS, true, NULL);
@@ -842,37 +941,43 @@ static int add_ipu_page(struct f2fs_io_info *fio, struct bio **bio,
 	enum temp_type temp;
 	bool found = false;
 	int ret = -EAGAIN;
+	int pid_log;
 
+	/* PISA: IPU bios are listed per temperature and per-PID log */
 	for (temp = HOT; temp < NR_TEMP_TYPE && !found; temp++) {
-		struct f2fs_bio_info *io = sbi->write_io[DATA] + temp;
-		struct list_head *head = &io->bio_list;
-		struct bio_entry *be;
+		for (pid_log = 0; pid_log < sbi->pid_logs[temp] && !found;
+		     pid_log++) {
+			struct f2fs_bio_info *io =
+				F2FS_WRITE_IO(sbi, DATA, temp, pid_log);
+			struct list_head *head = &io->bio_list;
+			struct bio_entry *be;
 
-		f2fs_down_write(&io->bio_list_lock);
-		list_for_each_entry(be, head, list) {
-			if (be->bio != *bio)
-				continue;
+			f2fs_down_write(&io->bio_list_lock);
+			list_for_each_entry(be, head, list) {
+				if (be->bio != *bio)
+					continue;
 
-			found = true;
+				found = true;
 
-			f2fs_bug_on(sbi, !page_is_mergeable(sbi, *bio,
-							    *fio->last_block,
-							    fio->new_blkaddr));
-			if (f2fs_crypt_mergeable_bio(*bio,
-					fio->page->mapping->host,
-					fio->page->index, fio) &&
-			    bio_add_page(*bio, page, PAGE_SIZE, 0) ==
-					PAGE_SIZE) {
-				ret = 0;
+				f2fs_bug_on(sbi, !page_is_mergeable(sbi, *bio,
+								*fio->last_block,
+								fio->new_blkaddr));
+				if (f2fs_crypt_mergeable_bio(*bio,
+						fio->page->mapping->host,
+						fio->page->index, fio) &&
+				    bio_add_page(*bio, page, PAGE_SIZE, 0) ==
+						PAGE_SIZE) {
+					ret = 0;
+					break;
+				}
+
+				/* page can't be merged into bio; submit the bio */
+				del_bio_entry(be);
+				f2fs_submit_write_bio(sbi, *bio, DATA, temp);
 				break;
 			}
-
-			/* page can't be merged into bio; submit the bio */
-			del_bio_entry(be);
-			f2fs_submit_write_bio(sbi, *bio, DATA);
-			break;
+			f2fs_up_write(&io->bio_list_lock);
 		}
-		f2fs_up_write(&io->bio_list_lock);
 	}
 
 	if (ret) {
@@ -889,52 +994,60 @@ void f2fs_submit_merged_ipu_write(struct f2fs_sb_info *sbi,
 	enum temp_type temp;
 	bool found = false;
 	struct bio *target = bio ? *bio : NULL;
+	int pid_log;
 
 	f2fs_bug_on(sbi, !target && !page);
 
 	for (temp = HOT; temp < NR_TEMP_TYPE && !found; temp++) {
-		struct f2fs_bio_info *io = sbi->write_io[DATA] + temp;
-		struct list_head *head = &io->bio_list;
-		struct bio_entry *be;
+		for (pid_log = 0; pid_log < sbi->pid_logs[temp] && !found;
+		     pid_log++) {
+			struct f2fs_bio_info *io =
+				F2FS_WRITE_IO(sbi, DATA, temp, pid_log);
+			struct list_head *head = &io->bio_list;
+			struct bio_entry *be;
 
-		if (list_empty(head))
-			continue;
+			if (list_empty(head))
+				continue;
 
-		f2fs_down_read(&io->bio_list_lock);
-		list_for_each_entry(be, head, list) {
-			if (target)
-				found = (target == be->bio);
-			else
-				found = __has_merged_page(be->bio, NULL,
-								page, 0);
-			if (found)
-				break;
-		}
-		f2fs_up_read(&io->bio_list_lock);
-
-		if (!found)
-			continue;
-
-		found = false;
-
-		f2fs_down_write(&io->bio_list_lock);
-		list_for_each_entry(be, head, list) {
-			if (target)
-				found = (target == be->bio);
-			else
-				found = __has_merged_page(be->bio, NULL,
-								page, 0);
-			if (found) {
-				target = be->bio;
-				del_bio_entry(be);
-				break;
+			f2fs_down_read(&io->bio_list_lock);
+			list_for_each_entry(be, head, list) {
+				if (target)
+					found = (target == be->bio);
+				else
+					found = __has_merged_page(be->bio, NULL,
+									page, 0);
+				if (found)
+					break;
 			}
+			f2fs_up_read(&io->bio_list_lock);
+
+			if (!found)
+				continue;
+
+			found = false;
+
+			f2fs_down_write(&io->bio_list_lock);
+			list_for_each_entry(be, head, list) {
+				if (target)
+					found = (target == be->bio);
+				else
+					found = __has_merged_page(be->bio, NULL,
+									page, 0);
+				if (found) {
+					target = be->bio;
+					del_bio_entry(be);
+					break;
+				}
+			}
+			f2fs_up_write(&io->bio_list_lock);
 		}
-		f2fs_up_write(&io->bio_list_lock);
+		/* leave temp at the temperature of the bio found */
+		if (found)
+			break;
 	}
 
 	if (found)
-		f2fs_submit_write_bio(sbi, target, DATA);
+		f2fs_submit_write_bio(sbi, target, DATA, temp);
 	if (bio && *bio) {
 		bio_put(*bio);
 		*bio = NULL;
@@ -958,13 +1071,15 @@ int f2fs_merge_page_bio(struct f2fs_io_info *fio)
 	if (bio && !page_is_mergeable(fio->sbi, bio, *fio->last_block,
 						fio->new_blkaddr))
 		f2fs_submit_merged_ipu_write(fio->sbi, &bio, NULL);
+	fio->sbi->fdp_pid_merge_try_stat[2]++;	/* CoFDP stats */
 alloc_new:
 	if (!bio) {
 		bio = __bio_alloc(fio, BIO_MAX_VECS);
 		f2fs_set_bio_crypt_ctx(bio, fio->page->mapping->host,
 				       fio->page->index, fio, GFP_NOIO);
 
-		add_bio_entry(fio->sbi, bio, page, fio->temp);
+		add_bio_entry(fio->sbi, bio, page, fio->temp,
+			      fio->sbi->pidir_enabled ? fio->fdp_pid : 0);
 	} else {
 		if (add_ipu_page(fio, &bio, page))
 			goto alloc_new;
@@ -1005,7 +1120,9 @@ void f2fs_submit_page_write(struct f2fs_io_info *fio)
 {
 	struct f2fs_sb_info *sbi = fio->sbi;
 	enum page_type btype = PAGE_TYPE_OF_BIO(fio->type);
-	struct f2fs_bio_info *io = sbi->write_io[btype] + fio->temp;
+	/* PISA: merge into the bio of the per-PID log picked for this I/O */
+	struct f2fs_bio_info *io = F2FS_WRITE_IO(sbi, btype, fio->temp,
+						 fio->fdp_pid);
 	struct page *bio_page;
 
 	f2fs_bug_on(sbi, is_read_io(fio->op));
@@ -1069,8 +1186,10 @@ alloc_new:
 		io->fio = *fio;
 	}
 
+	sbi->fdp_pid_merge_try_stat[3]++;	/* CoFDP stats */
 	if (bio_add_page(io->bio, bio_page, PAGE_SIZE, 0) < PAGE_SIZE) {
 		__submit_merged_bio(io);
+		sbi->fdp_pid_nomerge_stat[3]++;	/* CoFDP stats */
 		goto alloc_new;
 	}
 
@@ -4279,6 +4398,24 @@ static int f2fs_iomap_begin(struct inode *inode, loff_t offset, loff_t length,
 	if ((inode->i_state & I_DIRTY_DATASYNC) ||
 	    offset + length > i_size_read(inode))
 		iomap->flags |= IOMAP_F_DIRTY;
+
+	/*
+	 * CoFDP: PID of the direct I/O write bios of this mapping (iomap only
+	 * passes a non-zero value down to the bio). PiDir mode picks the PISA
+	 * log of the inode, the KernelFDP-F2FS baseline the data temperature
+	 * (HOT/WARM/COLD = 1/2/3). NOTE: unlike buffered writes, blocks that
+	 * f2fs_map_blocks() allocated above come from log 0 of m_seg_type.
+	 * See KNOWN_ISSUES (F2FS-7, BLK-4).
+	 */
+	if (flags & IOMAP_WRITE) {
+		struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
+
+		if (sbi->pidir_enabled)
+			iomap->fdp_pid = (u16)f2fs_pisa_log(sbi,
+					map.m_seg_type, inode->i_ino);
+		else
+			iomap->fdp_pid = (u16)(map.m_seg_type + 1);
+	}
 
 	return 0;
 }

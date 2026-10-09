@@ -813,6 +813,7 @@ static int __bio_clone(struct bio *bio, struct bio *bio_src, gfp_t gfp)
 {
 	bio_set_flag(bio, BIO_CLONED);
 	bio->bi_ioprio = bio_src->bi_ioprio;
+	bio->fdp_pid = bio_src->fdp_pid;
 	bio->bi_iter = bio_src->bi_iter;
 
 	if (bio->bi_bdev) {

@@ -181,6 +181,9 @@ struct request {
 
 	u64 fifo_time;
 
+	/* CoFDP: FDP placement ID of the bios in this request */
+	unsigned int fdp_pid;
+
 	/*
 	 * completion callback.
 	 */

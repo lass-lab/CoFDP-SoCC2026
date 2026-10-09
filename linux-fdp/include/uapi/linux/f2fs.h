@@ -45,6 +45,14 @@
 #define F2FS_IOC_START_ATOMIC_REPLACE	_IO(F2FS_IOCTL_MAGIC, 25)
 
 /*
+ * CoFDP fp-remap: map a directory and everything below it to a new set of
+ * placement IDs, i.e. turn it into a Flexible P-Directory. The argument
+ * points to a __u32 bitmap of PIDs (bits 0..30). The number 16 is shared
+ * with F2FS_IOC_RESIZE_FS; the two commands differ in their argument size.
+ */
+#define F2FS_IOC_FP_REMAP		_IOW(F2FS_IOCTL_MAGIC, 16, __u32)
+
+/*
  * should be same as XFS_IOC_GOINGDOWN.
  * Flags for going down operation used by FS_IOC_GOINGDOWN
  */

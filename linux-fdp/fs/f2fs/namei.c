@@ -216,6 +216,40 @@ static void set_file_temperature(struct f2fs_sb_info *sbi, struct inode *inode,
 		file_set_hot(inode);
 }
 
+/*
+ * PiDir-FS: a directory whose name is a concatenation of "fp<pid>" tokens
+ * (or legacy "pp<pid>" tokens), e.g. "fp0fp2fp4fp6", is created as a
+ * Flexible P-Directory mapped to those PIDs (0..30). Returns true and the
+ * PID bitmap if @name has this form.
+ */
+static bool f2fs_parse_flexible_pdir_name(const char *name, u32 *bitmap)
+{
+	const char *p = name;
+	u32 map = 0;
+
+	while (*p) {
+		unsigned int pid = 0;
+
+		if ((p[0] != 'f' && p[0] != 'p') || p[1] != 'p')
+			return false;
+		p += 2;
+
+		if (!isdigit(*p))
+			return false;
+		while (isdigit(*p)) {
+			pid = pid * 10 + (*p - '0');
+			if (pid > 30)
+				return false;
+			p++;
+		}
+
+		map |= 1U << pid;
+	}
+
+	*bitmap = map;
+	return true;
+}
+
 static struct inode *f2fs_new_inode(struct mnt_idmap *idmap,
 						struct inode *dir, umode_t mode,
 						const char *name)
@@ -245,7 +279,11 @@ static struct inode *f2fs_new_inode(struct mnt_idmap *idmap,
 	inode->i_blocks = 0;
 	simple_inode_init_ts(inode);
 	F2FS_I(inode)->i_crtime = inode_get_mtime(inode);
-	inode->i_generation = get_random_u32();
+	/*
+	 * PiDir-FS: i_generation holds the PID bits (PinodeBlock), which a new
+	 * file or directory inherits from its parent directory.
+	 */
+	inode->i_generation = dir->i_generation;
 
 	if (S_ISDIR(inode->i_mode))
 		F2FS_I(inode)->i_current_depth = 1;
@@ -255,6 +293,7 @@ static struct inode *f2fs_new_inode(struct mnt_idmap *idmap,
 		err = -EINVAL;
 		goto fail;
 	}
+	f2fs_pidir_set(sbi, ino, inode->i_generation);
 
 	if (f2fs_sb_has_project_quota(sbi) &&
 		(F2FS_I(dir)->i_flags & F2FS_PROJINHERIT_FL))
@@ -758,6 +797,7 @@ static int f2fs_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 {
 	struct f2fs_sb_info *sbi = F2FS_I_SB(dir);
 	struct inode *inode;
+	u32 bitmap;
 	int err;
 
 	if (unlikely(f2fs_cp_error(sbi)))
@@ -770,6 +810,12 @@ static int f2fs_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 	inode = f2fs_new_inode(idmap, dir, S_IFDIR | mode, NULL);
 	if (IS_ERR(inode))
 		return PTR_ERR(inode);
+
+	/* PiDir-FS: "fp<pid>..." creates a Flexible P-Directory */
+	if (f2fs_parse_flexible_pdir_name(dentry->d_name.name, &bitmap)) {
+		inode->i_generation = COFDP_PID_FLEXIBLE | bitmap;
+		f2fs_pidir_set(sbi, inode->i_ino, inode->i_generation);
+	}
 
 	inode->i_op = &f2fs_dir_inode_operations;
 	inode->i_fop = &f2fs_dir_operations;
