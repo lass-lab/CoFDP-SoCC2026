@@ -45,6 +45,24 @@ struct f2fs_checkpoint *cp;
 #define last_zone(cur)		((cur - 1) * c.segs_per_zone)
 #define last_section(cur)	(cur + (c.secs_per_zone - 1) * c.segs_per_sec)
 
+/*
+ * PiDir-FS log layout. The CoFDP kernel keeps fdp_log_n logs per segment type
+ * and restores log j >= 1 of temperature t from checkpoint slot 3 * j + t of
+ * cur_{data,node}_segno/blkoff (so at most 21 logs per type are usable).
+ * mkfs gives every log its own zone:
+ *   base logs, in CURSEG order:	zones 0..5
+ *   data slot s (3..63):		zone PIDIR_DATA_SLOT_ZONE + s (9..69)
+ *   node slot s (3..63):		zone PIDIR_NODE_SLOT_ZONE + s (70..130)
+ * Zones 6..8 stay unused.
+ */
+#define PIDIR_DATA_SLOT_ZONE	6
+#define PIDIR_NODE_SLOT_ZONE	67
+#define PIDIR_NR_ZONES	(PIDIR_NODE_SLOT_ZONE + MAX_ACTIVE_NODE_LOGS)
+#define pidir_zone(zone)	((zone) * c.segs_per_zone)
+
+/* first free root dentry slot, after ".", ".." and "lost+found" (2 slots) */
+#define PIDIR_ROOT_DENTRY_SLOT	4
+
 /* Return time fixed by the user or current time by default */
 #define mkfs_time ((c.fixed_time == -1) ? time(NULL) : c.fixed_time)
 
@@ -205,6 +223,71 @@ static void verify_cur_segs(void)
 	c.cur_seg[0] = 0;
 	for (i = 1; i < NR_CURSEG_TYPE; i++)
 		c.cur_seg[i] = next_zone(i - 1);
+}
+
+/*
+ * Initial P-Directory @index is named "p<PID>" after its raw PID (the reclaim
+ * group is not part of the name). A 16-bit PID needs at most 6 characters, so
+ * the name always fits in one dentry slot.
+ */
+static int f2fs_pdir_name(unsigned int index, char name[F2FS_SLOT_LEN])
+{
+	return snprintf(name, F2FS_SLOT_LEN, "p%u",
+				(unsigned int)c.initial_pdir_pid[index]);
+}
+
+/*
+ * PiDir-FS, called by main() before mkfs writes anything to the device:
+ * reject the layouts that cannot hold the per-PID logs and read the PIDs of
+ * the FDP device. If they cannot be read or the device reports none, mkfs
+ * aborts and leaves the device untouched, so PiDir-FS always gets at least
+ * one Initial P-Directory.
+ */
+int f2fs_pidir_discover(void)
+{
+	int nr;
+
+	if ((c.feature & cpu_to_le32(F2FS_FEATURE_RO)) || c.heap ||
+							c.zoned_mode) {
+		MSG(0, "\tError: PiDir-FS (-O lost_found) does not support "
+			"read-only, heap-based (-a) or zoned layouts\n");
+		return -1;
+	}
+
+	nr = f2fs_pidir_query_pids(c.initial_pdir_pid, F2FS_MAX_INITIAL_PDIRS);
+	if (nr < 0)
+		return -1;
+	c.nr_initial_pdirs = nr;
+	return 0;
+}
+
+/*
+ * PiDir-FS: check that the per-PID log layout fits in the main area and give
+ * every Initial P-Directory the next inode number (after root, quota and
+ * lost+found). The PIDs (at least one) were read by f2fs_pidir_discover().
+ */
+static int f2fs_pidir_prepare(uint32_t total_zones)
+{
+	char name[F2FS_SLOT_LEN];
+	unsigned int i;
+
+	ASSERT(c.nr_initial_pdirs);
+
+	if (total_zones < PIDIR_NR_ZONES) {
+		MSG(0, "\tError: PiDir-FS (-O lost_found) needs %u zones in "
+			"the main area, only %u fit on this device\n",
+			PIDIR_NR_ZONES, total_zones);
+		return -1;
+	}
+
+	MSG(0, "Info: PiDir-FS: %u Initial P-Directories:", c.nr_initial_pdirs);
+	for (i = 0; i < c.nr_initial_pdirs; i++) {
+		c.initial_pdir_ino[i] = c.next_free_nid++;
+		f2fs_pdir_name(i, name);
+		MSG(0, " %s", name);
+	}
+	MSG(0, "\n");
+	return 0;
 }
 
 static int f2fs_prepare_super_block(void)
@@ -532,6 +615,9 @@ static int f2fs_prepare_super_block(void)
 	if (c.feature & cpu_to_le32(F2FS_FEATURE_LOST_FOUND))
 		c.lpf_ino = c.next_free_nid++;
 
+	if (PIDIR_ENABLED && f2fs_pidir_prepare(total_zones) < 0)
+		return -1;
+
 	if (c.feature & cpu_to_le32(F2FS_FEATURE_RO))
 		avail_zones = 2;
 	else
@@ -565,6 +651,10 @@ static int f2fs_prepare_super_block(void)
 		c.cur_seg[CURSEG_HOT_DATA] = next_zone(CURSEG_COLD_NODE);
 		c.cur_seg[CURSEG_WARM_DATA] = next_zone(CURSEG_HOT_DATA);
 		c.cur_seg[CURSEG_COLD_DATA] = next_zone(CURSEG_WARM_DATA);
+	} else if (PIDIR_ENABLED) {
+		/* base log of CURSEG type i in zone i, see PIDIR_*_SLOT_ZONE */
+		for (i = 0; i < NR_CURSEG_TYPE; i++)
+			c.cur_seg[i] = pidir_zone(i);
 	} else {
 		c.cur_seg[CURSEG_HOT_NODE] = 0;
 		c.cur_seg[CURSEG_WARM_NODE] = next_zone(CURSEG_HOT_NODE);
@@ -579,7 +669,7 @@ static int f2fs_prepare_super_block(void)
 	}
 
 	/* if there is redundancy, reassign it */
-	if (!(c.feature & cpu_to_le32(F2FS_FEATURE_RO)))
+	if (!(c.feature & cpu_to_le32(F2FS_FEATURE_RO)) && !PIDIR_ENABLED)
 		verify_cur_segs();
 
 	cure_extension_list();
@@ -691,7 +781,7 @@ static int f2fs_write_check_point_pack(void)
 	unsigned char *nat_bits = NULL, *empty_nat_bits;
 	uint64_t cp_seg_blk = 0;
 	uint32_t crc = 0, flags;
-	unsigned int i;
+	unsigned int i, k;
 	char *cp_payload = NULL;
 	char *sum_compact, *sum_compact_p;
 	struct f2fs_summary *sum_entry;
@@ -746,11 +836,26 @@ static int f2fs_write_check_point_pack(void)
 		set_cp(cur_node_segno[i], 0xffffffff);
 		set_cp(cur_data_segno[i], 0xffffffff);
 	}
+	if (PIDIR_ENABLED) {
+		/*
+		 * Per-PID log slots: empty segments, blkoff 0, LFS.
+		 * NOTE: their SIT entries are left zero, i.e. typed HOT_DATA;
+		 * see KNOWN_ISSUES (MKFS-1).
+		 */
+		for (i = 3; i < MAX_ACTIVE_DATA_LOGS; i++)
+			set_cp(cur_data_segno[i],
+				pidir_zone(PIDIR_DATA_SLOT_ZONE + i));
+		for (i = 3; i < MAX_ACTIVE_NODE_LOGS; i++)
+			set_cp(cur_node_segno[i],
+				pidir_zone(PIDIR_NODE_SLOT_ZONE + i));
+	}
 
-	set_cp(cur_node_blkoff[0], 1 + c.quota_inum + c.lpf_inum);
-	set_cp(cur_data_blkoff[0], 1 + c.quota_dnum + c.lpf_dnum);
+	set_cp(cur_node_blkoff[0], 1 + c.quota_inum + c.lpf_inum +
+			c.nr_initial_pdirs);
+	set_cp(cur_data_blkoff[0], 1 + c.quota_dnum + c.lpf_dnum +
+			c.nr_initial_pdirs);
 	set_cp(valid_block_count, 2 + c.quota_inum + c.quota_dnum +
-			c.lpf_inum + c.lpf_dnum);
+			c.lpf_inum + c.lpf_dnum + 2 * c.nr_initial_pdirs);
 	set_cp(rsvd_segment_count, c.reserved_segments);
 
 	/*
@@ -797,8 +902,10 @@ static int f2fs_write_check_point_pack(void)
 
 	set_cp(ckpt_flags, flags);
 	set_cp(cp_pack_start_sum, 1 + get_sb(cp_payload));
-	set_cp(valid_node_count, 1 + c.quota_inum + c.lpf_inum);
-	set_cp(valid_inode_count, 1 + c.quota_inum + c.lpf_inum);
+	set_cp(valid_node_count, 1 + c.quota_inum + c.lpf_inum +
+			c.nr_initial_pdirs);
+	set_cp(valid_inode_count, 1 + c.quota_inum + c.lpf_inum +
+			c.nr_initial_pdirs);
 	set_cp(next_free_nid, c.next_free_nid);
 	set_cp(sit_ver_bitmap_bytesize, ((get_sb(segment_count_sit) / 2) <<
 			get_sb(log_blocks_per_seg)) / 8);
@@ -860,7 +967,8 @@ static int f2fs_write_check_point_pack(void)
 	SET_SUM_TYPE((&sum->footer), SUM_TYPE_DATA);
 
 	journal = &sum->journal;
-	journal->n_nats = cpu_to_le16(1 + c.quota_inum + c.lpf_inum);
+	journal->n_nats = cpu_to_le16(1 + c.quota_inum + c.lpf_inum +
+			c.nr_initial_pdirs);
 	journal->nat_j.entries[0].nid = sb->root_ino;
 	journal->nat_j.entries[0].ne.version = 0;
 	journal->nat_j.entries[0].ne.ino = sb->root_ino;
@@ -889,6 +997,20 @@ static int f2fs_write_check_point_pack(void)
 				get_sb(main_blkaddr) +
 				get_cp(cur_node_segno[0]) *
 				c.blks_per_seg + i);
+		i++;
+	}
+
+	for (k = 0; k < c.nr_initial_pdirs; k++) {
+		journal->nat_j.entries[i].nid =
+				cpu_to_le32(c.initial_pdir_ino[k]);
+		journal->nat_j.entries[i].ne.version = 0;
+		journal->nat_j.entries[i].ne.ino =
+				cpu_to_le32(c.initial_pdir_ino[k]);
+		journal->nat_j.entries[i].ne.block_addr = cpu_to_le32(
+				get_sb(main_blkaddr) +
+				get_cp(cur_node_segno[0]) *
+				c.blks_per_seg + i);
+		i++;
 	}
 
 	memcpy(sum_compact_p, &journal->n_nats, SUM_JOURNAL_SIZE);
@@ -905,13 +1027,19 @@ static int f2fs_write_check_point_pack(void)
 	journal->sit_j.entries[0].segno = cp->cur_node_segno[0];
 	journal->sit_j.entries[0].se.vblocks =
 				cpu_to_le16((CURSEG_HOT_NODE << 10) |
-						(1 + c.quota_inum + c.lpf_inum));
+						(1 + c.quota_inum + c.lpf_inum +
+						c.nr_initial_pdirs));
 	f2fs_set_bit(0, (char *)journal->sit_j.entries[0].se.valid_map);
 	for (i = 1; i <= c.quota_inum; i++)
 		f2fs_set_bit(i, (char *)journal->sit_j.entries[0].se.valid_map);
-	if (c.lpf_inum)
+	if (c.lpf_inum) {
+		f2fs_set_bit(i, (char *)journal->sit_j.entries[0].se.valid_map);
+		i++;
+	}
+	for (k = 0; k < c.nr_initial_pdirs; k++, i++)
 		f2fs_set_bit(i, (char *)journal->sit_j.entries[0].se.valid_map);
 
+	/* no Initial P-Directories on read-only images (f2fs_pidir_discover) */
 	if (c.feature & cpu_to_le32(F2FS_FEATURE_RO)) {
 		/* data sit for root */
 		journal->sit_j.entries[1].segno = cp->cur_data_segno[0];
@@ -935,11 +1063,16 @@ static int f2fs_write_check_point_pack(void)
 		journal->sit_j.entries[3].segno = cp->cur_data_segno[0];
 		journal->sit_j.entries[3].se.vblocks =
 					cpu_to_le16((CURSEG_HOT_DATA << 10) |
-							(1 + c.quota_dnum + c.lpf_dnum));
+							(1 + c.quota_dnum + c.lpf_dnum +
+							c.nr_initial_pdirs));
 		f2fs_set_bit(0, (char *)journal->sit_j.entries[3].se.valid_map);
 		for (i = 1; i <= c.quota_dnum; i++)
 			f2fs_set_bit(i, (char *)journal->sit_j.entries[3].se.valid_map);
-		if (c.lpf_dnum)
+		if (c.lpf_dnum) {
+			f2fs_set_bit(i, (char *)journal->sit_j.entries[3].se.valid_map);
+			i++;
+		}
+		for (k = 0; k < c.nr_initial_pdirs; k++, i++)
 			f2fs_set_bit(i, (char *)journal->sit_j.entries[3].se.valid_map);
 
 		journal->sit_j.entries[4].segno = cp->cur_data_segno[1];
@@ -975,6 +1108,12 @@ static int f2fs_write_check_point_pack(void)
 	if (c.lpf_dnum) {
 		(sum_entry + off)->nid = cpu_to_le32(c.lpf_ino);
 		(sum_entry + off)->ofs_in_node = 0;
+		off++;
+	}
+
+	for (k = 0; k < c.nr_initial_pdirs; k++, off++) {
+		(sum_entry + off)->nid = cpu_to_le32(c.initial_pdir_ino[k]);
+		(sum_entry + off)->ofs_in_node = 0;
 	}
 
 	/* warm data summary, nothing to do */
@@ -1004,6 +1143,11 @@ static int f2fs_write_check_point_pack(void)
 	if (c.lpf_inum) {
 		i++;
 		sum->entries[i].nid = cpu_to_le32(c.lpf_ino);
+		sum->entries[i].ofs_in_node = 0;
+	}
+	for (k = 0; k < c.nr_initial_pdirs; k++) {
+		i++;
+		sum->entries[i].nid = cpu_to_le32(c.initial_pdir_ino[k]);
 		sum->entries[i].ofs_in_node = 0;
 	}
 
@@ -1171,7 +1315,8 @@ static int f2fs_discard_obsolete_dnode(void)
 	offset += c.cur_seg[CURSEG_WARM_NODE] * c.blks_per_seg;
 
 	last_inode_pos = start_inode_pos +
-		c.cur_seg[CURSEG_HOT_NODE] * c.blks_per_seg + c.quota_inum + c.lpf_inum;
+		c.cur_seg[CURSEG_HOT_NODE] * c.blks_per_seg + c.quota_inum +
+		c.lpf_inum + c.nr_initial_pdirs;
 
 	do {
 		if (offset < get_sb(main_blkaddr) || offset >= end_blkaddr)
@@ -1224,6 +1369,10 @@ static int f2fs_write_root_inode(void)
 			c.blks_per_seg + 1);
 
 	raw_node->i.i_mode = cpu_to_le16(0x41ed);
+	/*
+	 * NOTE: the Initial P-Directories are not counted in i_links; see
+	 * KNOWN_ISSUES (MKFS-2).
+	 */
 	if (c.lpf_ino)
 		raw_node->i.i_links = cpu_to_le32(3);
 	else
@@ -1241,7 +1390,12 @@ static int f2fs_write_root_inode(void)
 	raw_node->i.i_ctime_nsec = 0;
 	raw_node->i.i_mtime = cpu_to_le32(mkfs_time);
 	raw_node->i.i_mtime_nsec = 0;
-	raw_node->i.i_generation = 0;
+	/*
+	 * CoFDP: i_generation carries the PID of an inode (PinodeBlock) and new
+	 * inodes inherit it from their parent directory, so files created in
+	 * the root directory use PID 1. lost+found keeps 0.
+	 */
+	raw_node->i.i_generation = cpu_to_le32(1);
 	raw_node->i.i_xattr_nid = 0;
 	raw_node->i.i_flags = 0;
 	raw_node->i.i_current_depth = cpu_to_le32(1);
@@ -1334,6 +1488,10 @@ static int f2fs_write_default_quota(int qtype, unsigned int blkaddr,
 	dqblk.dqb_pad = cpu_to_le32(0);
 	dqblk.dqb_ihardlimit = cpu_to_le64(0);
 	dqblk.dqb_isoftlimit = cpu_to_le64(0);
+	/*
+	 * NOTE: the Initial P-Directories are not counted in the usage; see
+	 * KNOWN_ISSUES (MKFS-3).
+	 */
 	if (c.lpf_ino)
 		dqblk.dqb_curinodes = cpu_to_le64(2);
 	else
@@ -1616,10 +1774,144 @@ exit:
 	return err;
 }
 
+/*
+ * Initial P-Directories (PiDir-FS). Directory @index is "p<PID>" in the root
+ * directory. Its "."/".." dentry block and its inode follow lost+found in the
+ * HOT_DATA and HOT_NODE logs, and both blocks are written with the PID of the
+ * directory attached.
+ */
+static block_t f2fs_add_default_dentry_pdir(unsigned int index)
+{
+	struct f2fs_dentry_block *dent_blk;
+	uint64_t data_blk_offset;
+
+	dent_blk = calloc(F2FS_BLKSIZE, 1);
+	if (dent_blk == NULL) {
+		MSG(1, "\tError: Calloc Failed for dent_blk!!!\n");
+		return 0;
+	}
+
+	dent_blk->dentry[0].hash_code = 0;
+	dent_blk->dentry[0].ino = cpu_to_le32(c.initial_pdir_ino[index]);
+	dent_blk->dentry[0].name_len = cpu_to_le16(1);
+	dent_blk->dentry[0].file_type = F2FS_FT_DIR;
+	memcpy(dent_blk->filename[0], ".", 1);
+
+	dent_blk->dentry[1].hash_code = 0;
+	dent_blk->dentry[1].ino = sb->root_ino;
+	dent_blk->dentry[1].name_len = cpu_to_le16(2);
+	dent_blk->dentry[1].file_type = F2FS_FT_DIR;
+	memcpy(dent_blk->filename[1], "..", 2);
+
+	test_and_set_bit_le(0, dent_blk->dentry_bitmap);
+	test_and_set_bit_le(1, dent_blk->dentry_bitmap);
+
+	data_blk_offset = get_sb(main_blkaddr);
+	data_blk_offset += c.cur_seg[CURSEG_HOT_DATA] * c.blks_per_seg +
+		1 + c.quota_dnum + c.lpf_dnum + index;
+
+	DBG(1, "\tWriting default dentry P-Directory %u, at offset 0x%08"
+			PRIx64"\n", index, data_blk_offset);
+	if (f2fs_pidir_write_block(dent_blk, data_blk_offset,
+					c.initial_pdir_pid[index])) {
+		MSG(1, "\tError While writing the dentry_blk to disk!!!\n");
+		free(dent_blk);
+		return 0;
+	}
+
+	free(dent_blk);
+	return data_blk_offset;
+}
+
+static int f2fs_write_pdir_inode(unsigned int index)
+{
+	struct f2fs_node *raw_node;
+	uint64_t blk_size_bytes, main_area_node_seg_blk_offset;
+	block_t data_blk_nor;
+	char name[F2FS_SLOT_LEN];
+	int len, err = 0;
+
+	raw_node = calloc(F2FS_BLKSIZE, 1);
+	if (raw_node == NULL) {
+		MSG(1, "\tError: Calloc Failed for raw_node!!!\n");
+		return -1;
+	}
+
+	main_area_node_seg_blk_offset = get_sb(main_blkaddr);
+	main_area_node_seg_blk_offset += c.cur_seg[CURSEG_HOT_NODE] *
+		c.blks_per_seg + 1 + c.quota_inum + c.lpf_inum + index;
+
+	raw_node->footer.nid = cpu_to_le32(c.initial_pdir_ino[index]);
+	raw_node->footer.ino = raw_node->footer.nid;
+	raw_node->footer.cp_ver = cpu_to_le64(1);
+	/*
+	 * NOTE: points at this block itself, root and lost+found use own + 1;
+	 * see KNOWN_ISSUES (MKFS-4).
+	 */
+	raw_node->footer.next_blkaddr =
+			cpu_to_le32(main_area_node_seg_blk_offset);
+
+	raw_node->i.i_mode = cpu_to_le16(0x41ff); /* 0777 */
+	raw_node->i.i_links = cpu_to_le32(2);
+	raw_node->i.i_uid = cpu_to_le32(c.root_uid);
+	raw_node->i.i_gid = cpu_to_le32(c.root_gid);
+
+	blk_size_bytes = 1 << get_sb(log_blocksize);
+	raw_node->i.i_size = cpu_to_le64(1 * blk_size_bytes);
+	raw_node->i.i_blocks = cpu_to_le64(2);
+
+	raw_node->i.i_atime = cpu_to_le32(mkfs_time);
+	raw_node->i.i_atime_nsec = 0;
+	raw_node->i.i_ctime = cpu_to_le32(mkfs_time);
+	raw_node->i.i_ctime_nsec = 0;
+	raw_node->i.i_mtime = cpu_to_le32(mkfs_time);
+	raw_node->i.i_mtime_nsec = 0;
+	/* PinodeBlock: the PID of this Initial P-Directory (MSB clear) */
+	raw_node->i.i_generation = cpu_to_le32(c.initial_pdir_pid[index]);
+	raw_node->i.i_xattr_nid = 0;
+	raw_node->i.i_flags = 0;
+	raw_node->i.i_pino = sb->root_ino;
+	len = f2fs_pdir_name(index, name);
+	raw_node->i.i_namelen = cpu_to_le32(len);
+	memcpy(raw_node->i.i_name, name, len);
+	raw_node->i.i_current_depth = cpu_to_le32(1);
+	raw_node->i.i_dir_level = DEF_DIR_LEVEL;
+	/*
+	 * NOTE: unlike lost+found, the extra_attr, project quota, crtime and
+	 * compression fields are not initialised for P-Directories; see
+	 * KNOWN_ISSUES (MKFS-5).
+	 */
+
+	data_blk_nor = f2fs_add_default_dentry_pdir(index);
+	if (data_blk_nor == 0) {
+		MSG(1, "\tError: Failed to add default dentries for %s!!!\n",
+				name);
+		err = -1;
+		goto exit;
+	}
+	raw_node->i.i_addr[get_extra_isize(raw_node)] = cpu_to_le32(data_blk_nor);
+
+	if (c.feature & cpu_to_le32(F2FS_FEATURE_INODE_CHKSUM))
+		raw_node->i.i_inode_checksum =
+			cpu_to_le32(f2fs_inode_chksum(raw_node));
+
+	DBG(1, "\tWriting %s inode (hot node), at offset 0x%08"PRIx64"\n",
+			name, main_area_node_seg_blk_offset);
+	if (f2fs_pidir_write_block(raw_node, main_area_node_seg_blk_offset,
+					c.initial_pdir_pid[index])) {
+		MSG(1, "\tError: While writing the raw_node to disk!!!\n");
+		err = -1;
+	}
+exit:
+	free(raw_node);
+	return err;
+}
+
 static int f2fs_add_default_dentry_root(void)
 {
 	struct f2fs_dentry_block *dent_blk = NULL;
 	uint64_t data_blk_offset = 0;
+	unsigned int index;
 
 	dent_blk = calloc(F2FS_BLKSIZE, 1);
 	if(dent_blk == NULL) {
@@ -1660,6 +1952,22 @@ static int f2fs_add_default_dentry_root(void)
 		test_and_set_bit_le(3, dent_blk->dentry_bitmap);
 	}
 
+	/* Initial P-Directories, one slot each */
+	for (index = 0; index < c.nr_initial_pdirs; index++) {
+		char name[F2FS_SLOT_LEN];
+		int slot = PIDIR_ROOT_DENTRY_SLOT + index;
+		int len = f2fs_pdir_name(index, name);
+
+		dent_blk->dentry[slot].hash_code = cpu_to_le32(
+			f2fs_dentry_hash(0, 0, (unsigned char *)name, len));
+		dent_blk->dentry[slot].ino =
+				cpu_to_le32(c.initial_pdir_ino[index]);
+		dent_blk->dentry[slot].name_len = cpu_to_le16(len);
+		dent_blk->dentry[slot].file_type = F2FS_FT_DIR;
+		memcpy(dent_blk->filename[slot], name, len);
+		test_and_set_bit_le(slot, dent_blk->dentry_bitmap);
+	}
+
 	data_blk_offset = get_sb(main_blkaddr);
 	data_blk_offset += c.cur_seg[CURSEG_HOT_DATA] *
 				c.blks_per_seg;
@@ -1679,6 +1987,7 @@ static int f2fs_add_default_dentry_root(void)
 static int f2fs_create_root_dir(void)
 {
 	enum quota_type qtype;
+	unsigned int index;
 	int err = 0, i = 0;
 
 	err = f2fs_write_root_inode();
@@ -1702,6 +2011,14 @@ static int f2fs_create_root_dir(void)
 		if (err < 0) {
 			MSG(1, "\tError: Failed to write lost+found inode!!!\n");
 			goto exit;
+		}
+		for (index = 0; index < c.nr_initial_pdirs; index++) {
+			err = f2fs_write_pdir_inode(index);
+			if (err < 0) {
+				MSG(1, "\tError: Failed to write "
+					"P-Directory inode!!!\n");
+				goto exit;
+			}
 		}
 	}
 

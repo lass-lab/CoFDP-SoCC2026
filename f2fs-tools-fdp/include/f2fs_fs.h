@@ -457,6 +457,9 @@ typedef struct {
 #define ALIGN_DOWN(addrs, size)	(((addrs) / (size)) * (size))
 #define ALIGN_UP(addrs, size)	ALIGN_DOWN(((addrs) + (size) - 1), (size))
 
+/* CoFDP PiDir-FS: max. number of Initial P-Directories created by mkfs */
+#define F2FS_MAX_INITIAL_PDIRS	16
+
 struct f2fs_configuration {
 	uint32_t reserved_segments;
 	uint32_t new_reserved_segments;
@@ -534,6 +537,11 @@ struct f2fs_configuration {
 	uint32_t lpf_ino;
 	uint32_t root_uid;
 	uint32_t root_gid;
+
+	/* PiDir-FS (-O lost_found): one Initial P-Directory per FDP PID */
+	uint32_t nr_initial_pdirs;
+	uint16_t initial_pdir_pid[F2FS_MAX_INITIAL_PDIRS];	/* raw PID */
+	uint32_t initial_pdir_ino[F2FS_MAX_INITIAL_PDIRS];
 
 	/* defragmentation parameters */
 	int defrag_shrink;
@@ -723,10 +731,14 @@ enum {
  * 16 logs by default. The number, 16, is expected to cover all the cases
  * enoughly. The implementaion currently uses no more than 6 logs.
  * Half the logs are used for nodes, and the other half are used for data.
+ *
+ * CoFDP raises the maximum to 128 (64 node + 64 data checkpoint slots) for the
+ * per-PID logs of PiDir-FS. These values set the on-disk size of struct
+ * f2fs_checkpoint and must match the CoFDP kernel.
  */
-#define MAX_ACTIVE_LOGS	16
-#define MAX_ACTIVE_NODE_LOGS	8
-#define MAX_ACTIVE_DATA_LOGS	8
+#define MAX_ACTIVE_LOGS	128
+#define MAX_ACTIVE_NODE_LOGS	64
+#define MAX_ACTIVE_DATA_LOGS	64
 
 #define F2FS_FEATURE_ENCRYPT		0x0001
 #define F2FS_FEATURE_BLKZONED		0x0002
@@ -857,7 +869,8 @@ struct f2fs_checkpoint {
 	unsigned char sit_nat_version_bitmap[];
 };
 
-static_assert(sizeof(struct f2fs_checkpoint) == 192, "");
+/* 192 bytes upstream, 976 with the 64 + 64 log slots of CoFDP (= kernel) */
+static_assert(sizeof(struct f2fs_checkpoint) == 976, "");
 
 #define CP_BITMAP_OFFSET	\
 	(offsetof(struct f2fs_checkpoint, sit_nat_version_bitmap))

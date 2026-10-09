@@ -447,6 +447,10 @@ int main(int argc, char *argv[])
 	if (f2fs_get_device_info() < 0)
 		return -1;
 
+	/* PiDir-FS: read the PIDs of the FDP device before anything is written */
+	if (PIDIR_ENABLED && f2fs_pidir_discover() < 0)
+		goto err_format;
+
 	if (f2fs_check_overwrite()) {
 		char *zero_buf = NULL;
 		int i;

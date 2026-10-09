@@ -46,6 +46,10 @@ AC_ARG_WITH([blkid],
 	AS_HELP_STRING([--without-blkid],
 	  [Ignore presence of libblkid and disable blkid support]))
 
+AC_ARG_WITH([xnvme],
+	AS_HELP_STRING([--without-xnvme],
+	  [Build mkfs.f2fs without libxnvme, i.e. without PiDir-FS (-O lost_found)]))
+
 # Checks for programs.
 AC_PROG_CC
 AM_PROG_AR
@@ -84,6 +88,20 @@ AC_CHECK_LIB([uuid], [uuid_clear],
 		AC_DEFINE([HAVE_LIBUUID], [1],
 		[Define if you have libuuid])
 	], [], [])
+
+# xNVMe is used by mkfs.f2fs only (PiDir-FS: FDP placement-ID discovery and
+# PID-tagged writes of the Initial P-Directories). It is required unless
+# --without-xnvme is given; mkfs.f2fs then rejects -O lost_found.
+AS_IF([test "x$with_xnvme" != "xno"], [
+	AC_CHECK_LIB([xnvme], [xnvme_queue_get_cmd_ctx],
+		[AC_SUBST([libxnvme_LIBS], ["-lxnvme"])
+			AC_DEFINE([HAVE_LIBXNVME], [1],
+			[Define if you have libxnvme])
+		], [AC_MSG_ERROR([libxnvme not found: mkfs.f2fs needs xNVMe for PiDir-FS (-O lost_found); install xNVMe or configure --without-xnvme])
+		], [])
+], [
+	AC_MSG_NOTICE([building without libxnvme: mkfs.f2fs cannot create PiDir-FS (-O lost_found)])
+])
 
 AC_CHECK_LIB([winpthread], [clock_gettime],
 	[AC_SUBST([libwinpthread_LIBS], ["-lwinpthread"])

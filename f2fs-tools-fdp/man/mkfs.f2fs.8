@@ -189,6 +189,15 @@ Enable inode creation time feature. Requires extra attr.
 .TP
 .B lost_found
 Enable lost+found feature.
+In this CoFDP version it also creates PiDir-FS for an NVMe FDP device:
+one Initial P-Directory "p<PID>" per placement identifier, read from the
+device through xNVMe.
+Use it on one whole NVMe namespace (no \-c) with a 4 KiB LBA format.
+PiDir-FS cannot be combined with \-O ro, \-a 1 or \-m, and needs at least
+131 zones in the main area.
+mkfs.f2fs fails without writing to the device if the placement identifiers
+cannot be read, if the device reports none or more than 16, or if
+mkfs.f2fs was built without libxnvme.
 .TP
 .B verity
 Enable support for verity protected files (a.k.a. fs-verity).

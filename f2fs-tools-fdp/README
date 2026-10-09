@@ -12,6 +12,7 @@ You should install the following packages.
  - autoconf
  - libtool
  - libselinux1-dev
+ - xNVMe 0.7.x (libxnvme and its headers), see "CoFDP: PiDir-FS" below
 
 Initial compilation
 -------------------
@@ -47,3 +48,38 @@ How to run by default
  $ mkfs.f2fs -l [LABEL] $DEV
 
 For more mkfs options, see the man page.
+
+CoFDP: PiDir-FS
+---------------
+
+This tree adds the mkfs.f2fs part of CoFDP. "mkfs.f2fs -O lost_found"
+creates PiDir-FS on an NVMe Flexible Data Placement (FDP) SSD: mkfs reads
+the placement identifiers (PIDs) of the device from the FDP Reclaim Unit
+Handle Status through xNVMe, sets up the checkpoint slots of the per-PID
+logs and creates one Initial P-Directory "p<PID>" per PID in the root
+directory, writing its blocks with that PID attached. The CoFDP kernel
+enables PiDir-FS from the lost_found feature bit. Without -O lost_found,
+mkfs.f2fs creates no P-Directories and does not use xNVMe.
+
+All tools in this tree use the CoFDP checkpoint layout (64 node and 64 data
+log slots instead of 8 and 8, see MAX_ACTIVE_LOGS in include/f2fs_fs.h).
+Use them only on file systems made by this mkfs.f2fs, and mount those with
+the CoFDP kernel (linux-fdp).
+
+ - ./configure fails if libxnvme is not found. "./configure --without-xnvme"
+   builds the tools without xNVMe; mkfs.f2fs then rejects -O lost_found.
+ - Run mkfs.f2fs -O lost_found on a whole NVMe namespace with a 4 KiB LBA
+   format, as the only device (no -c): the Initial P-Directory blocks are
+   written with NVMe commands whose LBA is the F2FS block address.
+ - mkfs.f2fs -O lost_found fails before writing to the device if xNVMe
+   cannot open it, if the Reclaim Unit Handle Status command fails, or if
+   the device reports no PID or more than 16 PIDs.
+ - PiDir-FS cannot be combined with -O ro, -a 1 (heap-based allocation) or
+   -m (zoned devices), and needs at least 131 zones (262 MiB with the
+   default zone size) in the main area.
+
+ # mkfs.f2fs -f -O lost_found /dev/nvme0n1
+ ...
+ Info: PiDir-FS: 8 Initial P-Directories: p0 p1 p2 p3 p4 p5 p6 p7
+
+Known defects of the PiDir-FS layout are listed in ../KNOWN_ISSUES.md.
