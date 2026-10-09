@@ -862,6 +862,16 @@ __xfs_sb_from_disk(
 	if (convert_xquota)
 		xfs_sb_quota_from_disk(to);
 
+	/*
+	 * CoFDP: sb_fdp_pids takes the first byte of the metadir padding.
+	 * It is also used on non-metadir file systems (the CoFDP kernel
+	 * reads this byte directly), so unlike the fields below it is not
+	 * gated on METADIR.  NOTE: no feature bit covers it, and xfs_repair
+	 * zeroes it on non-metadir file systems; see KNOWN_ISSUES
+	 * (XFSPROGS-1).
+	 */
+	to->sb_fdp_pids = from->sb_fdp_pids;
+
 	if (to->sb_features_incompat & XFS_SB_FEAT_INCOMPAT_METADIR) {
 		to->sb_metadirino = be64_to_cpu(from->sb_metadirino);
 		to->sb_rgblklog = from->sb_rgblklog;
@@ -1039,6 +1049,9 @@ xfs_sb_to_disk(
 	to->sb_lsn = cpu_to_be64(from->sb_lsn);
 	if (from->sb_features_incompat & XFS_SB_FEAT_INCOMPAT_META_UUID)
 		uuid_copy(&to->sb_meta_uuid, &from->sb_meta_uuid);
+
+	/* CoFDP: written for all v5 superblocks, see __xfs_sb_from_disk() */
+	to->sb_fdp_pids = from->sb_fdp_pids;
 
 	if (from->sb_features_incompat & XFS_SB_FEAT_INCOMPAT_METADIR) {
 		to->sb_metadirino = cpu_to_be64(from->sb_metadirino);

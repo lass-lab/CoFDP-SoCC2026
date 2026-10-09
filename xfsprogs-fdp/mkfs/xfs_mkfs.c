@@ -81,6 +81,7 @@ enum {
 	D_COWEXTSIZE,
 	D_DAXINHERIT,
 	D_CONCURRENCY,
+	D_FDP_PIDS,
 	D_MAX_OPTS,
 };
 
@@ -342,12 +343,14 @@ static struct opt_params dopts = {
 		[D_COWEXTSIZE] = "cowextsize",
 		[D_DAXINHERIT] = "daxinherit",
 		[D_CONCURRENCY] = "concurrency",
+		[D_FDP_PIDS] = "fdp_pids",
 		[D_MAX_OPTS] = NULL,
 	},
 	.subopt_params = {
 		{ .index = D_AGCOUNT,
 		  .conflicts = { { &dopts, D_AGSIZE },
 				 { &dopts, D_CONCURRENCY },
+				 { &dopts, D_FDP_PIDS },
 				 { NULL, LAST_CONFLICT } },
 		  .minval = 1,
 		  .maxval = XFS_MAX_AGNUMBER,
@@ -391,6 +394,7 @@ static struct opt_params dopts = {
 		{ .index = D_AGSIZE,
 		  .conflicts = { { &dopts, D_AGCOUNT },
 				 { &dopts, D_CONCURRENCY },
+				 { &dopts, D_FDP_PIDS },
 				 { NULL, LAST_CONFLICT } },
 		  .convert = true,
 		  .minval = XFS_AG_MIN_BYTES,
@@ -469,10 +473,20 @@ static struct opt_params dopts = {
 		{ .index = D_CONCURRENCY,
 		  .conflicts = { { &dopts, D_AGCOUNT },
 				 { &dopts, D_AGSIZE },
+				 { &dopts, D_FDP_PIDS },
 				 { NULL, LAST_CONFLICT } },
 		  .minval = 0,
 		  .maxval = INT_MAX,
 		  .defaultval = 1,
+		},
+		{ .index = D_FDP_PIDS,
+		  .conflicts = { { &dopts, D_AGCOUNT },
+				 { &dopts, D_AGSIZE },
+				 { &dopts, D_CONCURRENCY },
+				 { NULL, LAST_CONFLICT } },
+		  .minval = 0,
+		  .maxval = 31,	/* PID bitmap bit 31 is the flexible flag */
+		  .defaultval = SUBOPT_NEEDS_VAL,
 		},
 	},
 };
@@ -1102,6 +1116,7 @@ struct cli_params {
 	int	log_concurrency;
 	int	rtvol_concurrency;
 	int	imaxpct;
+	int	fdp_pids;	/* CoFDP: FDP PID count, 0 = disabled */
 
 	/* parameters where 0 is not a valid value */
 	int64_t	agcount;
@@ -1164,6 +1179,8 @@ struct mkfs_params {
 	uint64_t	rgsize;
 	uint64_t	rgcount;
 
+	int		fdp_pids;	/* CoFDP: FDP PID count, 0 = disabled */
+
 	int		imaxpct;
 
 	bool		loginternal;
@@ -1214,7 +1231,7 @@ usage( void )
 			    pquota|pqnoenforce]\n\
 /* data subvol */	[-d agcount=n,agsize=n,file,name=xxx,size=num,\n\
 			    (sunit=value,swidth=value|su=num,sw=num|noalign),\n\
-			    sectsize=num,concurrency=num]\n\
+			    sectsize=num,concurrency=num,fdp_pids=n]\n\
 /* force overwrite */	[-f]\n\
 /* inode size */	[-i perblock=n|size=num,maxpct=n,attr=0|1|2,\n\
 			    projid32bit=0|1,sparse=0|1,nrext64=0|1,\n\
@@ -1889,6 +1906,9 @@ data_opts_parser(
 		break;
 	case D_CONCURRENCY:
 		set_data_concurrency(opts, subopt, cli, value);
+		break;
+	case D_FDP_PIDS:
+		cli->fdp_pids = getnum(value, opts, subopt);
 		break;
 	default:
 		return -EINVAL;
@@ -2954,6 +2974,16 @@ _("metadata directory not supported without CRC support\n"));
 		if (cli->sb_feat.qflags) {
 			fprintf(stderr,
 _("persistent quota flags not supported without CRC support\n"));
+			usage();
+		}
+
+		/*
+		 * The CoFDP kernel keeps per-inode PID bits in di_pad2 of v3
+		 * inodes, and sb_fdp_pids is only written to v5 superblocks.
+		 */
+		if (cli->fdp_pids) {
+			fprintf(stderr,
+_("fdp_pids not supported without CRC support\n"));
 			usage();
 		}
 	}
@@ -4086,7 +4116,23 @@ calculate_initial_ag_geometry(
 	struct mkfs_params	*cfg,
 	struct cli_params	*cli)
 {
-	if (cli->data_concurrency > 0) {
+	if (cli->fdp_pids > 0) {
+		/*
+		 * CoFDP: one AG per FDP placement ID (1:1 PID-to-AG layout).
+		 * NOTE: align_ag_geometry() may still adjust agsize/agcount
+		 * (stripe or atomic write alignment) after the banner below
+		 * has been printed; see KNOWN_ISSUES (XFSPROGS-3).
+		 */
+		cfg->fdp_pids = cli->fdp_pids;
+		cfg->agcount = cli->fdp_pids;
+		cfg->agsize = cfg->dblocks / cfg->agcount +
+				(cfg->dblocks % cfg->agcount != 0);
+		fprintf(stdout,
+_("FDP mode: %d PIDs, agcount=%llu, agsize=%llu blocks\n"),
+			cfg->fdp_pids,
+			(unsigned long long)cfg->agcount,
+			(unsigned long long)cfg->agsize);
+	} else if (cli->data_concurrency > 0) {
 		calc_concurrency_ag_geometry(cfg, cli);
 	} else if (cli->agsize) {	/* User-specified AG size */
 		cfg->agsize = getnum(cli->agsize, &dopts, D_AGSIZE);
@@ -5425,6 +5471,7 @@ finish_superblock_setup(
 	sbp->sb_rootino = sbp->sb_rbmino = sbp->sb_rsumino = NULLFSINO;
 	sbp->sb_metadirino = NULLFSINO;
 	sbp->sb_agcount = (xfs_agnumber_t)cfg->agcount;
+	sbp->sb_fdp_pids = (uint8_t)cfg->fdp_pids;
 	sbp->sb_rbmblocks = cfg->rtbmblocks;
 	sbp->sb_logblocks = (xfs_extlen_t)cfg->logblocks;
 	sbp->sb_rextslog = libxfs_compute_rextslog(cfg->rtextents);

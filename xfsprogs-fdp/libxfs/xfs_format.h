@@ -179,7 +179,8 @@ typedef struct xfs_sb {
 	xfs_rgnumber_t	sb_rgcount;	/* number of realtime groups */
 	xfs_rtxlen_t	sb_rgextents;	/* size of a realtime group in rtx */
 	uint8_t		sb_rgblklog;    /* rt group number shift */
-	uint8_t		sb_pad[7];	/* zeroes */
+	uint8_t		sb_fdp_pids;	/* CoFDP: FDP PID count, 0 = disabled */
+	uint8_t		sb_pad[6];	/* zeroes */
 	xfs_rfsblock_t	sb_rtstart;	/* start of internal RT section (FSB) */
 	xfs_filblks_t	sb_rtreserved;	/* reserved (zoned) RT blocks */
 
@@ -272,7 +273,8 @@ struct xfs_dsb {
 	__be32		sb_rgcount;	/* # of realtime groups */
 	__be32		sb_rgextents;	/* size of rtgroup in rtx */
 	__u8		sb_rgblklog;    /* rt group number shift */
-	__u8		sb_pad[7];	/* zeroes */
+	__u8		sb_fdp_pids;	/* CoFDP: FDP PID count, 0 = disabled */
+	__u8		sb_pad[6];	/* zeroes */
 	__be64		sb_rtstart;	/* start of internal RT section (FSB) */
 	__be64		sb_rtreserved;	/* reserved (zoned) RT blocks */
 
