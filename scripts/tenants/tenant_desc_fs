@@ -1,0 +1,30 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Fig. 14 tenants for bench_tenant_sep_fs.py: a write-mostly, a read-mostly and
+# a mixed fio tenant (rwratio = fraction of reads), each on a file in its own
+# P-Directory (fp1, fp2, fp3; fig14.sh sets their PIDs with fp-remap).
+[tenantA(write)]
+qdepth=8
+iosize_byte=4194304
+rwratio=0.05
+rwpattern=rand
+start_time_second=0
+run_time_second=300
+filepath=/home/femu/f2fs_fdp_mount/fp1/testfile
+
+[tenantB(read)]
+qdepth=8
+iosize_byte=4194304
+rwratio=0.6
+rwpattern=rand
+start_time_second=60
+run_time_second=60
+filepath=/home/femu/f2fs_fdp_mount/fp2/testfile
+
+[tenantC(mixed)]
+qdepth=8
+iosize_byte=4194304
+rwratio=0.3
+rwpattern=rand
+start_time_second=180
+run_time_second=60
+filepath=/home/femu/f2fs_fdp_mount/fp3/testfile

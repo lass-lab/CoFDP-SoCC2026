@@ -1,0 +1,32 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Tenants of bench_tenant_fdp_sep.py (Figs. 6 and 7): a write-mostly, a
+# read-mostly and a mixed fio tenant (rwratio = fraction of reads) on the raw
+# FDP namespace, each with its own LBA range and placement ID index (pid, fio
+# --fdp_pli: the PID and RG it selects depend on the device, see
+# scripts/README.md, "Figs. 6 and 7").
+[tenantA(write)]
+qdepth=64
+iosize_byte=524288
+rwratio=0.05
+rwpattern=rand
+start_time_second=0
+run_time_second=120
+pid=0
+
+[tenantB(read)]
+qdepth=64
+iosize_byte=524288
+rwratio=0.6
+rwpattern=rand
+start_time_second=20
+run_time_second=50
+pid=1
+
+[tenantC(mixed)]
+qdepth=64
+iosize_byte=524288
+rwratio=0.3
+rwpattern=rand
+start_time_second=90
+run_time_second=30
+pid=2
