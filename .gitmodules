@@ -1,0 +1,18 @@
+[submodule "FDP_CACHELIB/cachelib/external/fbthrift"]
+	path = FDP_CACHELIB/cachelib/external/fbthrift
+	url = https://github.com/facebook/fbthrift
+[submodule "FDP_CACHELIB/cachelib/external/folly"]
+	path = FDP_CACHELIB/cachelib/external/folly
+	url = https://github.com/facebook/folly
+[submodule "FDP_CACHELIB/cachelib/external/fizz"]
+	path = FDP_CACHELIB/cachelib/external/fizz
+	url = https://github.com/facebookincubator/fizz
+[submodule "FDP_CACHELIB/cachelib/external/wangle"]
+	path = FDP_CACHELIB/cachelib/external/wangle
+	url = https://github.com/facebook/wangle
+[submodule "FDP_CACHELIB/cachelib/external/mvfst"]
+	path = FDP_CACHELIB/cachelib/external/mvfst
+	url = https://github.com/facebook/mvfst
+[submodule "YCSB-cpp-fdp/HdrHistogram_c"]
+	path = YCSB-cpp-fdp/HdrHistogram_c
+	url = https://github.com/HdrHistogram/HdrHistogram_c.git
