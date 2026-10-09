@@ -220,6 +220,11 @@ struct StressorConfig : public JSONConfig {
   uint64_t numThreads{0}; // number of threads that will run
   uint64_t numKeys{0};    // number of keys that will be used
 
+  // Maximum test duration in seconds. 0 means no time limit (run until
+  // numOps completes). When set, the test stops after this many seconds
+  // even if numOps has not been reached.
+  uint64_t testDurationSec{0};
+
   // Req generation throttling delay for each thread; those generated reqs are
   // subject to an additional global rate shaping specified below (opRatePerSec)
   uint64_t opDelayBatch{0}; // how many requests before a delay is added

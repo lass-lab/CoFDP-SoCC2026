@@ -17,6 +17,7 @@
 #include "cachelib/navy/common/FdpNvme.h"
 
 #include <errno.h>
+#include <folly/String.h>
 #include <linux/nvme_ioctl.h>
 #include <sys/ioctl.h>
 
@@ -28,6 +29,13 @@
 namespace facebook {
 namespace cachelib {
 namespace navy {
+
+namespace {
+// CoFDP: timeout of the NVMe passthrough IO commands in milliseconds (~2.8h;
+// 0 means the kernel's default IO timeout), so that slow commands on the
+// emulated FDP SSD are not aborted.
+constexpr uint32_t kPassthruCmdTimeoutMs = 10000000;
+} // namespace
 
 FdpNvme::FdpNvme(const std::string& bdevName)
     : file_(openNvmeCharFile(bdevName)) {
@@ -59,15 +67,18 @@ void FdpNvme::initializeFDP(const std::string& bdevName) {
   if (!ruh_status->nruhsd) {
     throw std::invalid_argument("Failed to initialize FDP; nruhsd is 0");
   }
-  placementIDs_.reserve(ruh_status->nruhsd);
+  placementIDs_.resize(ruh_status->nruhsd);
   maxPIDIdx_ = ruh_status->nruhsd - 1;
   for (uint16_t i = 0; i <= maxPIDIdx_; ++i) {
     placementIDs_[i] = ruh_status->ruhss[i].pid;
   }
 
-  XLOGF(DBG, "Creating NvmeFdp, fd: {}, Num_PID: {}, 1st PID: {}, Last PID: {}",
-        file_.fd(), maxPIDIdx_ + 1, placementIDs_[0],
-        placementIDs_[maxPIDIdx_]);
+  // Placement handle i (see allocateFdpHandle) maps to placementIDs_[i].
+  XLOGF(INFO,
+        "Creating NvmeFdp, fd: {}, Num_PID: {}, 1st PID: {}, Last PID: {}, "
+        "PIDs: [{}]",
+        file_.fd(), maxPIDIdx_ + 1, placementIDs_[0], placementIDs_[maxPIDIdx_],
+        folly::join(", ", placementIDs_));
 }
 
 // NVMe IO Mnagement Receive fn for specific config reading
@@ -81,6 +92,7 @@ int FdpNvme::nvmeIOMgmtRecv(uint32_t nsid,
   // available as "TP4146 Flexible Data Placement 2022.11.30 Ratified"
   // in the following link:
   // https://nvmexpress.org/wp-content/uploads/NVM-Express-2.0-Ratified-TPs_20230111.zip
+  // NOTE: MOS is never set (operator precedence), see KNOWN_ISSUES (CL-6).
   uint32_t cdw10 = (op & 0xf) | (op_specific & 0xff << 16);
   uint32_t cdw11 = (data_len >> 2) - 1; // cdw11 is 0 based
 
@@ -162,12 +174,17 @@ void FdpNvme::prepFdpUringCmdSqe(struct io_uring_sqe& sqe,
   cmd->cdw10 = sLba & 0xffffffff;
   cmd->cdw11 = sLba >> 32;
   /* cdw12 represent number of lba's for read/write */
-  cmd->cdw12 = (dtype & 0xFF) << 20 | nLb;
-  cmd->cdw13 = (dspec << 16);
+  // CoFDP: the directive type (DTYPE, cdw12[23:20]) is not set, so @dtype is
+  // unused; the emulated FDP SSD (ConfFDP) only looks at DSPEC.
+  // NOTE: see KNOWN_ISSUES (CL-12).
+  cmd->cdw12 = nLb;
+  /* cdw13[31:16] is the directive specific field (DSPEC): the placement ID */
+  cmd->cdw13 = static_cast<uint32_t>(dspec) << 16;
   cmd->addr = (uint64_t)buf;
   cmd->data_len = size;
 
   cmd->nsid = nvmeData_.nsId();
+  cmd->timeout_ms = kPassthruCmdTimeoutMs;
 }
 
 void FdpNvme::prepReadUringCmdSqe(struct io_uring_sqe& sqe,
@@ -304,7 +321,9 @@ folly::File FdpNvme::openNvmeCharFile(const std::string& bdevName) {
     throw std::invalid_argument("Invalid NVMe device name");
   }
 
-  int flags{O_RDONLY};
+  // Opened read-write (upstream: O_RDONLY) since the passthrough commands
+  // sent through this file include writes.
+  int flags{O_RDWR};
   folly::File f;
 
   try {

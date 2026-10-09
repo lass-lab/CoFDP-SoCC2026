@@ -65,6 +65,9 @@ uint64_t getRegionSize(const navy::NavyConfig& config) {
 // @param bigHashStartOffsetLimit The start offset of this bighash can not be
 // smaller than or equal to this limit.
 // @param proto The proto of engine pair that this bighash will be set into.
+// @param isHybridFDPEnabled CoFDP HybridFDP: BigHash has its own file and
+// starts at offset 0 of that file. The returned offset still delimits the
+// address space of the BlockCache file.
 //
 // @return the starting offset of the setup bighash (inclusive)
 uint64_t setupBigHash(const navy::BigHashConfig& bigHashConfig,
@@ -72,7 +75,8 @@ uint64_t setupBigHash(const navy::BigHashConfig& bigHashConfig,
                       uint64_t bigHashReservedSize,
                       uint64_t bigHashEndOffset,
                       uint64_t bigHashStartOffsetLimit,
-                      cachelib::navy::EnginePairProto& proto) {
+                      cachelib::navy::EnginePairProto& proto,
+                      bool isHybridFDPEnabled) {
   auto bucketSize = bigHashConfig.getBucketSize();
   if (bucketSize != alignUp(bucketSize, ioAlignSize)) {
     throw std::invalid_argument(
@@ -86,7 +90,10 @@ uint64_t setupBigHash(const navy::BigHashConfig& bigHashConfig,
       alignDown(bigHashEndOffset - bigHashCacheOffset, bucketSize);
 
   auto bigHash = cachelib::navy::createBigHashProto();
-  bigHash->setLayout(bigHashCacheOffset, bigHashCacheSize, bucketSize);
+  // NOTE: keyed on the config flag, not on the device layout, see
+  // KNOWN_ISSUES (CL-13).
+  bigHash->setLayout(isHybridFDPEnabled ? 0 : bigHashCacheOffset,
+                     bigHashCacheSize, bucketSize);
 
   // Bucket Bloom filter size, bytes
   //
@@ -252,7 +259,7 @@ void setupCacheProtos(const navy::NavyConfig& config,
           totalCacheSize * enginesConfig.bigHash().getSizePct() / 100ul;
       bigHashStartOffset = setupBigHash(
           enginesConfig.bigHash(), ioAlignSize, bigHashSize, bigHashEndOffset,
-          blockCacheStartOffset, *enginePairProto);
+          blockCacheStartOffset, *enginePairProto, config.isHybridFDPEnabled());
       blockCacheSize = blockCacheSize == 0
                            ? bigHashStartOffset - blockCacheStartOffset
                            : blockCacheSize;
@@ -328,12 +335,16 @@ std::unique_ptr<cachelib::navy::Device> createDevice(
     std::shared_ptr<navy::DeviceEncryptor> encryptor) {
   auto blockSize = config.getBlockSize();
   auto maxDeviceWriteSize = config.getDeviceMaxWriteSize();
-  if (config.usesRaidFiles() || config.usesSimpleFile()) {
+  if (config.usesRaidFiles() || config.usesSimpleFile() ||
+      config.usesPerEngineFiles()) {
     auto stripeSize = 0;
     auto fileSize = config.getFileSize();
     std::vector<std::string> filePaths;
     if (config.usesSimpleFile()) {
       filePaths.emplace_back(config.getFileName());
+    } else if (config.usesPerEngineFiles()) {
+      // CoFDP HybridFDP: one file per engine, not striped
+      filePaths = config.getPerEngineFiles();
     } else {
       stripeSize = getRegionSize(config);
       filePaths = config.getRaidPaths();
@@ -351,7 +362,9 @@ std::unique_ptr<cachelib::navy::Device> createDevice(
         config.getQDepth(),
         config.isFDPEnabled(),
         std::move(encryptor),
-        config.getExclusiveOwner());
+        config.getExclusiveOwner(),
+        config.usesPerEngineFiles(),
+        config.usesDirectIo());
   } else {
     return cachelib::navy::createMemoryDevice(config.getFileSize(),
                                               std::move(encryptor), blockSize);

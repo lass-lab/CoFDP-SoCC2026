@@ -311,6 +311,14 @@ class BlockCacheConfig {
     return *this;
   }
 
+  // CoFDP: set the number of in-memory region buffers explicitly (cachebench
+  // navyNumInmemBuffers). Call it after setCleanRegions(), which also
+  // adjusts this number.
+  BlockCacheConfig& setNumInMemBuffers(uint32_t numInMemBuffers) noexcept {
+    numInMemBuffers_ = numInMemBuffers;
+    return *this;
+  }
+
   bool isLruEnabled() const { return lru_; }
 
   const std::vector<unsigned int>& getSFifoSegmentRatio() const {
@@ -350,7 +358,9 @@ class BlockCacheConfig {
   // configured to more threads if needed
   unsigned int cleanRegionThreads_{1};
   // Number of Navy BlockCache in-memory buffers.
-  uint32_t numInMemBuffers_{2};
+  // CoFDP: default raised from upstream's 2 (cachebench always sets the
+  // number explicitly through setNumInMemBuffers()).
+  uint32_t numInMemBuffers_{100};
   // Size for a region for Navy BlockCache (must be multiple of
   // blockSize_).
   uint32_t regionSize_{16 * 1024 * 1024};
@@ -482,10 +492,13 @@ class NavyConfig {
 
   bool usesSimpleFile() const noexcept { return !fileName_.empty(); }
   bool usesRaidFiles() const noexcept { return raidPaths_.size() > 0; }
+  // CoFDP HybridFDP: one file per engine (see setPerEngineFiles()).
+  bool usesPerEngineFiles() const noexcept { return !perEngineFiles_.empty(); }
   bool isBigHashEnabled() const {
     return enginesConfigs_[0].bigHash().getSizePct() > 0;
   }
   bool isFDPEnabled() const { return enableFDP_; }
+  bool isHybridFDPEnabled() const { return enableHybridFDP_; }
 
   std::map<std::string, std::string> serialize() const;
 
@@ -506,9 +519,11 @@ class NavyConfig {
   bool getExclusiveOwner() const { return isExclusiveOwner_; }
   const std::string& getFileName() const;
   const std::vector<std::string>& getRaidPaths() const;
+  const std::vector<std::string>& getPerEngineFiles() const;
   uint64_t getDeviceMetadataSize() const { return deviceMetadataSize_; }
   uint64_t getFileSize() const { return fileSize_; }
   bool getTruncateFile() const { return truncateFile_; }
+  bool usesDirectIo() const { return directIo_; }
   uint32_t getDeviceMaxWriteSize() const { return deviceMaxWriteSize_; }
   IoEngine getIoEngine() const { return ioEngine_; }
   unsigned int getQDepth() const { return qDepth_; }
@@ -554,6 +569,10 @@ class NavyConfig {
   void setBlockSize(uint64_t blockSize) noexcept { blockSize_ = blockSize; }
   // Set the NVMe FDP Device data placement mode in the Cachelib
   void setEnableFDP(bool enable) noexcept { enableFDP_ = enable; }
+  // CoFDP HybridFDP: BigHash (SOC) and BlockCache (LOC) each get their own
+  // file (see setPerEngineFiles()), placed in different P-Directories. With
+  // this flag set, BigHash starts at offset 0 of its file.
+  void setEnableHybridFDP(bool enable) noexcept { enableHybridFDP_ = enable; }
   // If true, Navy will only start if it's the sole owner of the file.
   // This only applies to non-memory-backed files.
   void setExclusiveOwner(bool isExclusiveOwner) noexcept {
@@ -570,6 +589,17 @@ class NavyConfig {
   void setRaidFiles(std::vector<std::string> raidPaths,
                     uint64_t fileSize,
                     bool truncateFile = false);
+  // CoFDP HybridFDP: set one file of @fileSize bytes per engine instead of
+  // RAID files. The paths are used in sorted order: the first file backs
+  // BigHash, the second one BlockCache.
+  // @throw std::invalid_argument if a simple file or RAID files have been
+  //        already set.
+  void setPerEngineFiles(std::vector<std::string> filePaths,
+                         uint64_t fileSize,
+                         bool truncateFile = false);
+  // CoFDP: open the cache files and devices with O_DIRECT (default, as
+  // upstream) or, if false, for buffered IO through the page cache.
+  void setDirectIo(bool directIo) noexcept { directIo_ = directIo; }
   // Set the parameter for a in-memory file.
   // This function is only for cachebench and unit tests to create
   // a MemoryDevice when no file path is set.
@@ -651,6 +681,8 @@ class NavyConfig {
   std::string fileName_;
   // An array of Navy RAID device file paths.
   std::vector<std::string> raidPaths_;
+  // CoFDP HybridFDP: the file paths, one per engine.
+  std::vector<std::string> perEngineFiles_;
   // The size of the metadata partition on the Navy device.
   uint64_t deviceMetadataSize_{};
   // The size of the file that Navy should use.
@@ -658,6 +690,8 @@ class NavyConfig {
   uint64_t fileSize_{};
   // Whether ask Navy to truncate the file it uses.
   bool truncateFile_{false};
+  // Whether the files are opened with O_DIRECT (otherwise buffered IO).
+  bool directIo_{true};
   // This controls granularity of the writes when we flush the region.
   // This is only used when in-mem buffer is enabled.
   uint32_t deviceMaxWriteSize_{};
@@ -709,6 +743,8 @@ class NavyConfig {
   // Whether Navy support the NVMe FDP data placement(TP4146) directives or not.
   // Reference: https://nvmexpress.org/nvmeflexible-data-placement-fdp-blog/
   bool enableFDP_{false};
+  // CoFDP HybridFDP mode (see setEnableHybridFDP()).
+  bool enableHybridFDP_{false};
 };
 } // namespace navy
 } // namespace cachelib

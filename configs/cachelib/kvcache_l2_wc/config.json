@@ -1,0 +1,87 @@
+{
+"cache_config": {
+    "cacheSizeMB": 120,
+    "allocFactor": 1.5,
+    "maxAllocSize": 4194304,
+    "minAllocSize": 64,
+  
+    // "navyQDepth": 64,
+    // "navyMaxNumReads": 64,
+    // "navyMaxNumWrites": 64,
+    "navyReaderThreads": 4,
+    "navyWriterThreads": 4,
+    "navySegmentedFifoSegmentRatio" : [1],
+
+    // "deviceMaxWriteSize": 16384,
+      "deviceMaxWriteSize": 8388608,
+            // "deviceMaxWriteSize": 1048576,
+
+  
+    "nvmCachePaths": ["/home/femu/f2fs_fdp_mount/fp3/large/", 
+        "/home/femu/f2fs_fdp_mount/fp3/small/"],
+    "writeAmpDeviceList": [
+      "nvme0n1"
+    ],
+  
+    "navyRegionSizeMB" : 8,
+  
+  
+    "navyBigHashBucketSize": 4096,
+    "navyBigHashSizePct": 50,
+    "navySmallItemMaxSize": 2048,
+    "navyBlockSize": 4096,
+    "navyParcelMemoryMB": 32,
+    // "nvmCacheSizeMB": 6144,
+    "nvmCacheSizeMB": 12288,
+    "htBucketPower": 20,
+
+    "moveOnSlabRelease": true,
+
+    // "poolRebalanceIntervalSec": 1,
+    // "rebalanceStrategy": "tail-age",
+    // "rebalanceMinRatio": 0.1,
+    // "rebalanceMinSlabs": 1,
+
+    "navyNumInmemBuffers": 8,
+  
+    "navyFileDirectIO": true,
+    "enableHyBridFDP": true
+  },
+  "test_config": {
+    "enableLookaside": true,
+    "generator": "online",
+    "numKeys": 963973,
+    // 1204967.25
+    // "numKeys": 4819869,
+
+    // "numKeys": 24099347,
+
+    // "numKeys": 72298041,
+    // "numKeys" : 2891921640,
+    "testDurationSec" : 300,
+    "numOps": 20000000,
+    // "numOps": 500000,
+
+    "numThreads": 256,
+    "poolDistributions": [
+      {
+        "addChainedRatio": 0.0,
+        "delRatio": 0.0,
+        "getRatio": 0.6,
+        "keySizeRange": [
+          8,
+          16
+        ],
+        "keySizeRangeProbability": [
+          1.0
+        ],
+        "loneGetRatio": 8.2e-06,
+        "loneSetRatio": 0.21,
+        "setRatio": 0.0,
+        "popDistFile": "pop.json",
+        "valSizeDistFile": "sizes.json",
+        "useLegacyKeyGen": true
+      }
+    ]
+  }
+}

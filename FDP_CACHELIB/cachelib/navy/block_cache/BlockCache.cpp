@@ -42,11 +42,9 @@ BlockCache::Config& BlockCache::Config::validate() {
   if (!device || !evictionPolicy) {
     throw std::invalid_argument("missing required param");
   }
-  if (regionSize > 256u << 20) {
-    // We allocate region in memory to reclaim. Too large region will cause
-    // problems: at least, long allocation times.
-    throw std::invalid_argument("region is too large");
-  }
+  // CoFDP: upstream rejects regions larger than 256 MiB because regions are
+  // allocated in memory to reclaim (long allocation times). The cap is lifted
+  // here since the CoFDP CacheLib configs use 512 MiB and 1 GiB regions.
   if (cacheSize <= 0) {
     throw std::invalid_argument("invalid size");
   }

@@ -109,6 +109,9 @@ find_package(FBThrift REQUIRED) # must come after wangle
 find_package(uring)
 if (NOT uring_FOUND)
   add_definitions(-DCACHELIB_IOURING_DISABLE)
+  # CoFDP: Navy's io_uring engine and the NVMe passthrough path (UserFDP) are
+  # mandatory in this fork.
+  message(FATAL_ERROR "liburing (>= 2.2) not found; it is required by this CacheLib fork")
 endif()
 
 # FBThrift - generates h/cpp files from .*thrift files

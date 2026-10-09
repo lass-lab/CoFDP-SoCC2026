@@ -140,9 +140,19 @@ class CacheStressor : public Stressor {
       std::lock_guard<std::mutex> l(timeMutex_);
       startTime_ = std::chrono::system_clock::now();
     }
-    std::cout << folly::sformat("Total {:.2f}M ops to be run",
-                                config_.numThreads * config_.numOps / 1e6)
-              << std::endl;
+    if (config_.testDurationSec > 0) {
+      deadline_ = std::chrono::steady_clock::now() +
+                  std::chrono::seconds(config_.testDurationSec);
+      std::cout
+          << folly::sformat("Test will run for up to {} seconds or {:.2f}M ops",
+                            config_.testDurationSec,
+                            config_.numThreads * config_.numOps / 1e6)
+          << std::endl;
+    } else {
+      std::cout << folly::sformat("Total {:.2f}M ops to be run",
+                                  config_.numThreads * config_.numOps / 1e6)
+                << std::endl;
+    }
 
     stressWorker_ = std::thread([this] {
       std::vector<std::thread> workers;
@@ -300,6 +310,13 @@ class CacheStressor : public Stressor {
              config_.maxInvalidDestructorCount &&
          !cache_->isNvmCacheDisabled() && !shouldTestStop();
          ++i) {
+      // CoFDP: stop after testDurationSec, checked every 1024 ops.
+      // NOTE: see KNOWN_ISSUES (CL-16).
+      if ((i & 1023) == 0 &&
+          deadline_ != std::chrono::steady_clock::time_point::max() &&
+          std::chrono::steady_clock::now() >= deadline_) {
+        break;
+      }
       try {
         // at the end of every operation, throttle per the config.
         SCOPE_EXIT { throttleFn(); };
@@ -591,6 +608,10 @@ class CacheStressor : public Stressor {
 
   // Whether flash cache has been warmed up
   bool hasNvmCacheWarmedUp_{false};
+
+  // Deadline for time-based termination. max() means no limit.
+  std::chrono::time_point<std::chrono::steady_clock> deadline_{
+      std::chrono::steady_clock::time_point::max()};
 };
 } // namespace cachebench
 } // namespace cachelib

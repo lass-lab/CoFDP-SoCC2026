@@ -16,6 +16,7 @@
 
 #include "cachelib/allocator/nvmcache/NavyConfig.h"
 
+#include <algorithm>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -32,6 +33,10 @@ const std::string& NavyConfig::getFileName() const {
 const std::vector<std::string>& NavyConfig::getRaidPaths() const {
   XDCHECK(usesRaidFiles());
   return raidPaths_;
+}
+const std::vector<std::string>& NavyConfig::getPerEngineFiles() const {
+  XDCHECK(usesPerEngineFiles());
+  return perEngineFiles_;
 }
 
 // admission policy settings
@@ -102,6 +107,17 @@ void NavyConfig::setRaidFiles(std::vector<std::string> raidPaths,
   truncateFile_ = truncateFile;
 }
 
+void NavyConfig::setPerEngineFiles(std::vector<std::string> filePaths,
+                                   uint64_t fileSize,
+                                   bool truncateFile) {
+  if (usesRaidFiles() || usesSimpleFile()) {
+    throw std::invalid_argument("already set RAID files or a simple file");
+  }
+  perEngineFiles_ = std::move(filePaths);
+  fileSize_ = fileSize;
+  truncateFile_ = truncateFile;
+}
+
 BlockCacheConfig& BlockCacheConfig::enableHitsBasedReinsertion(
     uint8_t hitsThreshold) {
   reinsertionConfig_.enableHitsBased(hitsThreshold);
@@ -133,7 +149,8 @@ BlockCacheConfig& BlockCacheConfig::setCleanRegions(
   // to avoid reinsertion failure when all buffers in clean regions
   // are pending flush and the reclaim job is running before flushing complete
   // (see T93961857, T93959811)
-  numInMemBuffers_ = 2 * cleanRegions;
+  // CoFDP: never lower the current number (upstream sets 2 * cleanRegions).
+  numInMemBuffers_ = std::max(2 * cleanRegions, numInMemBuffers_);
   cleanRegionThreads_ = cleanRegionThreads;
   return *this;
 }
@@ -279,6 +296,10 @@ std::map<std::string, std::string> NavyConfig::serialize() const {
   configMap["navyConfig::ioEngine"] = getIoEngineName(ioEngine_).str();
   configMap["navyConfig::QDepth"] = folly::to<std::string>(qDepth_);
   configMap["navyConfig::enableFDP"] = folly::to<std::string>(enableFDP_);
+  configMap["navyConfig::enableHyBridFDP"] =
+      folly::to<std::string>(enableHybridFDP_);
+  configMap["navyConfig::perEngineFiles"] = folly::join(",", perEngineFiles_);
+  configMap["navyConfig::directIo"] = directIo_ ? "true" : "false";
 
   // Job scheduler settings
   configMap["navyConfig::readerThreads"] =

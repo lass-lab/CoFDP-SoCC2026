@@ -90,8 +90,12 @@ struct Stats {
   util::PercentileStats::Estimates cacheAllocateLatencyNs;
   util::PercentileStats::Estimates cacheFindLatencyNs;
 
+  double nvmReadLatencyMicrosAvg{0};
+  double nvmWriteLatencyMicrosAvg{0};
+
   double nvmReadLatencyMicrosP50{0};
   double nvmReadLatencyMicrosP90{0};
+  double nvmReadLatencyMicrosP95{0};
   double nvmReadLatencyMicrosP99{0};
   double nvmReadLatencyMicrosP999{0};
   double nvmReadLatencyMicrosP9999{0};
@@ -100,6 +104,7 @@ struct Stats {
   double nvmReadLatencyMicrosP100{0};
   double nvmWriteLatencyMicrosP50{0};
   double nvmWriteLatencyMicrosP90{0};
+  double nvmWriteLatencyMicrosP95{0};
   double nvmWriteLatencyMicrosP99{0};
   double nvmWriteLatencyMicrosP999{0};
   double nvmWriteLatencyMicrosP9999{0};
@@ -238,6 +243,7 @@ struct Stats {
                                       val);
               };
 
+              fmtLatency("avg", latency.avg);
               fmtLatency("p50", latency.p50);
               fmtLatency("p90", latency.p90);
               fmtLatency("p99", latency.p99);
@@ -246,6 +252,8 @@ struct Stats {
               fmtLatency("p99999", latency.p99999);
               fmtLatency("p999999", latency.p999999);
               fmtLatency("p100", latency.p100);
+              // NOTE: always 0, see KNOWN_ISSUES (CL-15).
+              fmtLatency("stddev", latency.stddev);
             };
 
         printLatencies("Cache Find API latency", cacheFindLatencyNs);
@@ -310,6 +318,7 @@ struct Stats {
         out << folly::sformat("{:20} {:8} : {:>10.2f} us\n", cat, pct, val);
       };
 
+      fmtLatency(readCat, "avg", nvmReadLatencyMicrosAvg);
       fmtLatency(readCat, "p50", nvmReadLatencyMicrosP50);
       fmtLatency(readCat, "p90", nvmReadLatencyMicrosP90);
       fmtLatency(readCat, "p99", nvmReadLatencyMicrosP99);
@@ -319,6 +328,7 @@ struct Stats {
       fmtLatency(readCat, "p999999", nvmReadLatencyMicrosP999999);
       fmtLatency(readCat, "p100", nvmReadLatencyMicrosP100);
 
+      fmtLatency(writeCat, "avg", nvmWriteLatencyMicrosAvg);
       fmtLatency(writeCat, "p50", nvmWriteLatencyMicrosP50);
       fmtLatency(writeCat, "p90", nvmWriteLatencyMicrosP90);
       fmtLatency(writeCat, "p99", nvmWriteLatencyMicrosP99);

@@ -18,10 +18,38 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <iostream>
 namespace facebook {
 namespace cachelib {
 namespace cachebench {
+namespace {
+// CoFDP: the generators of keys, value sizes and access patterns are seeded
+// from the C library PRNG with this fixed seed (upstream: folly::Random).
+// NOTE: the per-thread seeds are drawn by concurrent threads, so the
+// generated workload is not bit-identical across runs, see KNOWN_ISSUES
+// (CL-N2).
+constexpr unsigned int kWorkloadSeed = 20180546;
+
+// Seeds drawn and discarded before generating the keys, and again before
+// generating the access patterns. They are part of the fixed seed sequence:
+// without them every generator would get a different seed.
+constexpr int kDiscardedSeeds = 10;
+
+// Returns a 64-bit seed made of two rand() draws (high word first).
+uint64_t nextSeed64() {
+  uint64_t seed = 0;
+  seed |= static_cast<uint64_t>(rand()) << 32;
+  seed |= rand();
+  return seed;
+}
+
+void discardSeeds() {
+  for (int i = 0; i < kDiscardedSeeds; i++) {
+    nextSeed64();
+  }
+}
+} // namespace
 
 WorkloadGenerator::WorkloadGenerator(const StressorConfig& config)
     : config_{config} {
@@ -59,10 +87,12 @@ const Request& WorkloadGenerator::getReq(uint8_t poolId,
 
 void WorkloadGenerator::generateKeys() {
   uint8_t pid = 0;
+  srand(kWorkloadSeed);
+  discardSeeds();
   auto fn = [pid, this](size_t start, size_t end) {
     // All keys are printable lower case english alphabet.
     std::uniform_int_distribution<char> charDis('a', 'z');
-    std::mt19937_64 gen(folly::Random::rand64());
+    std::mt19937_64 gen(nextSeed64());
     for (uint64_t i = start; i < end; i++) {
       size_t keySize =
           util::narrow_cast<size_t>(workloadDist_[pid].sampleKeySizeDist(gen));
@@ -111,7 +141,7 @@ void WorkloadGenerator::generateKeys() {
 void WorkloadGenerator::generateReqs() {
   generateFirstKeyIndexForPool();
   generateKeys();
-  std::mt19937_64 gen(folly::Random::rand64());
+  std::mt19937_64 gen(nextSeed64());
   for (size_t i = 0; i < config_.keyPoolDistribution.size(); i++) {
     size_t idx = workloadIdx(i);
     for (size_t j = firstKeyIndexForPool_[i]; j < firstKeyIndexForPool_[i + 1];
@@ -150,6 +180,7 @@ void WorkloadGenerator::generateKeyDistributions() {
   // generate a max of 4 billion op traces across all the pools and replay
   // the same when we need longer traces.
   std::chrono::seconds duration{0};
+  discardSeeds();
   for (uint64_t i = 0; i < config_.opPoolDistribution.size(); i++) {
     auto left = firstKeyIndexForPool_[i];
     auto right = firstKeyIndexForPool_[i + 1] - 1;
@@ -168,7 +199,7 @@ void WorkloadGenerator::generateKeyDistributions() {
 
     duration += detail::executeParallel(
         [&, this](size_t start, size_t end) {
-          std::mt19937_64 gen(folly::Random::rand64());
+          std::mt19937_64 gen(nextSeed64());
           auto popDist = workloadDist_[idx].getPopDist(left, right);
           for (uint64_t j = start; j < end; j++) {
             keyIndicesForPool_[i][j] =

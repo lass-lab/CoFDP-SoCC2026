@@ -89,6 +89,8 @@ CacheConfig::CacheConfig(const folly::dynamic& configJson) {
   JSONSetVal(configJson, navyEncryption);
   JSONSetVal(configJson, deviceMaxWriteSize);
   JSONSetVal(configJson, deviceEnableFDP);
+  JSONSetVal(configJson, enableHyBridFDP);
+  JSONSetVal(configJson, navyFileDirectIO);
 
   JSONSetVal(configJson, memoryOnlyTTL);
 

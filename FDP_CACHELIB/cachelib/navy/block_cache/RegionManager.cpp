@@ -528,7 +528,14 @@ bool RegionManager::deviceWrite(RelAddress addr, Buffer buf) {
   const auto bufSize = buf.size();
   XDCHECK(isValidIORange(addr.offset(), bufSize));
   auto physOffset = physicalOffset(addr);
-  if (!device_.write(physOffset, std::move(buf), placementHandle_)) {
+  // HybridFDP: regions live in the large object cache file, whose
+  // P-Directory provides the placement.
+  const bool written =
+      device_.usesPerEngineFiles()
+          ? device_.write(physOffset, std::move(buf),
+                          EngineFile::kLargeObjectCache)
+          : device_.write(physOffset, std::move(buf), placementHandle_);
+  if (!written) {
     return false;
   }
   physicalWrittenCount_.add(bufSize);
@@ -539,7 +546,11 @@ bool RegionManager::deviceWrite(RelAddress addr, BufferView view) {
   const auto bufSize = view.size();
   XDCHECK(isValidIORange(addr.offset(), bufSize));
   auto physOffset = physicalOffset(addr);
-  if (!device_.write(physOffset, view, placementHandle_)) {
+  const bool written =
+      device_.usesPerEngineFiles()
+          ? device_.write(physOffset, view, EngineFile::kLargeObjectCache)
+          : device_.write(physOffset, view, placementHandle_);
+  if (!written) {
     return false;
   }
   physicalWrittenCount_.add(bufSize);
@@ -567,6 +578,11 @@ Buffer RegionManager::read(const RegionDescriptor& desc,
   }
   XDCHECK(isValidIORange(addr.offset(), size));
 
+  if (device_.usesPerEngineFiles()) {
+    // HybridFDP: regions live in the large object cache file.
+    return device_.read(physicalOffset(addr), size,
+                        EngineFile::kLargeObjectCache);
+  }
   return device_.read(physicalOffset(addr), size);
 }
 
@@ -578,7 +594,9 @@ void RegionManager::drain() {
 
 void RegionManager::flush() {
   drain(); // Flush any pending reclaims
-  device_.flush();
+  // Flushes only the BlockCache file in HybridFDP mode, the whole device
+  // otherwise.
+  device_.flush(EngineFile::kLargeObjectCache);
 }
 
 void RegionManager::getCounters(const CounterVisitor& visitor) const {

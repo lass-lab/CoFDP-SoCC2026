@@ -45,22 +45,75 @@ void ProgressTracker::work() {
   ::localtime_r(&nowTimeT, &time);
   ::strftime(buf, sizeof(buf), "%H:%M:%S", &time);
   auto throughputStats = stressor_.aggregateThroughputStats();
-  auto mOpsPerSec = throughputStats.ops / 1e6;
+  // CoFDP: progress is reported in thousands of ops (upstream: millions).
+  auto kOpsCompleted = throughputStats.ops / 1e3;
 
   const auto currCacheStats = stressor_.getCacheStats();
   auto [overallHitRatio, ramHitRatio, nvmHitRatio] =
       currCacheStats.getHitRatios(prevStats_);
   auto thStr = folly::sformat(
-      "{} {:>10.2f}M ops completed. Hit Ratio {:6.2f}% "
+      "{} {:>10.2f}K ops completed. Hit Ratio {:6.2f}% "
       "(RAM {:6.2f}%, NVM {:6.2f}%)",
       buf,
-      mOpsPerSec,
+      kOpsCompleted,
       overallHitRatio,
       ramHitRatio,
       nvmHitRatio);
 
+  // CoFDP: latency lines. The estimates come from util::PercentileStats, i.e.
+  // a sliding window of 60 x 1s (about the last minute), not only the last
+  // progress interval.
+  // NVM device latency (always tracked by Navy)
+  auto fmtLat = [](double v) { return folly::sformat("{:.1f}", v); };
+  std::string nvmReadStr = folly::sformat(
+      "  NVM  Read Lat(us): avg={} p50={} p90={} p95={} p99={} p99.9={} "
+      "p99.99={}",
+      fmtLat(currCacheStats.nvmReadLatencyMicrosAvg),
+      fmtLat(currCacheStats.nvmReadLatencyMicrosP50),
+      fmtLat(currCacheStats.nvmReadLatencyMicrosP90),
+      fmtLat(currCacheStats.nvmReadLatencyMicrosP95),
+      fmtLat(currCacheStats.nvmReadLatencyMicrosP99),
+      fmtLat(currCacheStats.nvmReadLatencyMicrosP999),
+      fmtLat(currCacheStats.nvmReadLatencyMicrosP9999));
+  std::string nvmWriteStr = folly::sformat(
+      "  NVM Write Lat(us): avg={} p50={} p90={} p95={} p99={} p99.9={} "
+      "p99.99={}",
+      fmtLat(currCacheStats.nvmWriteLatencyMicrosAvg),
+      fmtLat(currCacheStats.nvmWriteLatencyMicrosP50),
+      fmtLat(currCacheStats.nvmWriteLatencyMicrosP90),
+      fmtLat(currCacheStats.nvmWriteLatencyMicrosP95),
+      fmtLat(currCacheStats.nvmWriteLatencyMicrosP99),
+      fmtLat(currCacheStats.nvmWriteLatencyMicrosP999),
+      fmtLat(currCacheStats.nvmWriteLatencyMicrosP9999));
+
+  // "SET": latency of CacheAllocator::allocate (always tracked)
+  const auto& setLat = currCacheStats.cacheAllocateLatencyNs;
+  std::string setLatStr = folly::sformat(
+      "  SET Lat(ns):       avg={} p50={} p90={} p95={} p99={} p99.9={} "
+      "p99.99={}",
+      setLat.avg, setLat.p50, setLat.p90, setLat.p95, setLat.p99, setLat.p999,
+      setLat.p9999);
+
+  // "GET": latency of the find API (only with --report_api_latency)
+  const auto& getLat = currCacheStats.cacheFindLatencyNs;
+  std::string getLatStr;
+  if (getLat.avg > 0) {
+    getLatStr = folly::sformat(
+        "  GET Lat(ns):       avg={} p50={} p90={} p95={} p99={} p99.9={} "
+        "p99.99={}",
+        getLat.avg, getLat.p50, getLat.p90, getLat.p95, getLat.p99, getLat.p999,
+        getLat.p9999);
+  }
+
   // log this always to stdout
-  std::cout << thStr << std::endl;
+  std::cout << thStr << "\n"
+            << nvmReadStr << "\n"
+            << nvmWriteStr << "\n"
+            << setLatStr;
+  if (!getLatStr.empty()) {
+    std::cout << "\n" << getLatStr;
+  }
+  std::cout << std::endl;
 
   // additionally log into the stats file
   if (statsFile_.is_open()) {

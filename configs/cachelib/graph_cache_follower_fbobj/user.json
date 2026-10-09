@@ -1,0 +1,65 @@
+{
+  "cache_config": {
+    "cacheSizeMB": 440,
+    "allocFactor": 1.5,
+    "maxAllocSize": 1048576,
+    "minAllocSize": 64,
+  
+    "navyEnableIoUring": true,
+    "navyQDepth": 1,
+    "deviceEnableFDP" : true,
+    
+    // "navySegmentedFifoSegmentRatio" : [1],
+    "navyReaderThreads": 2,
+    "navyWriterThreads": 2,
+    "deviceMaxWriteSize": 16777216,
+  
+    "nvmCachePaths": ["/dev/nvme0n1"],
+    "writeAmpDeviceList": [
+      "nvme0n1"
+    ],
+  
+    "navyRegionSizeMB" : 512,
+  
+  
+    "navyBigHashBucketSize": 4096,
+    "navyBigHashSizePct": 50,
+    "navySmallItemMaxSize": 2048,
+    "navyBlockSize": 4096,
+    "navyParcelMemoryMB": 2048,
+    "nvmCacheSizeMB": 6144,
+    "htBucketPower": 22,
+    "moveOnSlabRelease": true,
+    "poolRebalanceIntervalSec": 2,
+    "rebalanceStrategy": "hits",
+    "rebalanceMinRatio": 0.1,
+    "rebalanceMinSlabs": 2,
+    "navyNumInmemBuffers": 30
+  
+  },
+  "test_config": 
+    {
+      "addChainedRatio": 0.0, 
+      "delRatio": 0.0, 
+      "enableLookaside": true, 
+      "getRatio": 0.9568797693103636, 
+      "keySizeRange": [
+        1, 
+        8, 
+        64
+      ], 
+      "keySizeRangeProbability": [
+        0.3, 
+        0.7
+      ], 
+      "loneGetRatio": 0.043120230689636455, 
+      "numKeys": 37244430, 
+      "numOps": 5000000, 
+      "numThreads": 48, 
+      "popDistFile": "pop.json", 
+       
+      "setRatio": 0.0, 
+      "valSizeDistFile": "sizes.json"
+    }
+ 
+}

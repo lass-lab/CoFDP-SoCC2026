@@ -512,15 +512,21 @@ void BigHash::bfRebuild(BucketId bid, const Bucket* bucket) {
 
 void BigHash::flush() {
   XLOG(INFO, "Flush big hash");
-  device_.flush();
+  // Flushes only the BigHash file in HybridFDP mode, the whole device
+  // otherwise.
+  device_.flush(EngineFile::kSmallObjectCache);
 }
 
 Buffer BigHash::readBucket(BucketId bid) {
   auto buffer = device_.makeIOBuffer(bucketSize_);
   XDCHECK(!buffer.isNull());
 
+  // HybridFDP: buckets live in the small object cache file.
   const bool res =
-      device_.read(getBucketOffset(bid), buffer.size(), buffer.data());
+      device_.usesPerEngineFiles()
+          ? device_.read(getBucketOffset(bid), buffer.size(), buffer.data(),
+                         EngineFile::kSmallObjectCache)
+          : device_.read(getBucketOffset(bid), buffer.size(), buffer.data());
   if (!res) {
     return {};
   }
@@ -551,6 +557,11 @@ Buffer BigHash::readBucket(BucketId bid) {
 bool BigHash::writeBucket(BucketId bid, Buffer buffer) {
   auto* bucket = reinterpret_cast<Bucket*>(buffer.data());
   bucket->setChecksum(Bucket::computeChecksum(buffer.view()));
+  if (device_.usesPerEngineFiles()) {
+    // HybridFDP: placement comes from the P-Directory of the file.
+    return device_.write(getBucketOffset(bid), std::move(buffer),
+                         EngineFile::kSmallObjectCache);
+  }
   return device_.write(
       getBucketOffset(bid), std::move(buffer), placementHandle_);
 }

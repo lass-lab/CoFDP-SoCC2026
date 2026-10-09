@@ -26,13 +26,25 @@
 #include <folly/io/async/EventBase.h>
 #include <folly/io/async/EventBaseManager.h>
 #include <folly/io/async/EventHandler.h>
+#include <sys/ioctl.h>
 
 #include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <numeric>
 
 #include "cachelib/navy/common/FdpNvme.h"
 #include "cachelib/navy/common/Utils.h"
+
+#ifdef CACHELIB_IOURING_DISABLE
+#error "This CacheLib fork requires liburing (io_uring and NVMe passthrough)"
+#endif
+
+// From include/uapi/linux/f2fs.h, which older kernel headers do not ship.
+#ifndef F2FS_IOC_SET_PIN_FILE
+#define F2FS_IOCTL_MAGIC 0xf5
+#define F2FS_IOC_SET_PIN_FILE _IOW(F2FS_IOCTL_MAGIC, 13, uint32_t)
+#endif
 
 namespace facebook::cachelib::navy {
 
@@ -46,8 +58,10 @@ class IoContext;
 class AsyncIoContext;
 class FileDevice;
 
-// IO timeout in milliseconds (1s)
-static constexpr size_t kIOTimeoutMs = 1000;
+// IO timeout in milliseconds (1000s). Only used to log slow IOs; raised from
+// upstream's 1s so that IOs on the slow emulated (FEMU) device are not
+// reported as timeouts.
+static constexpr size_t kIOTimeoutMs = 1000000;
 
 // IO Operation type supported by IOReq
 enum OpType : uint8_t { INVALID = 0, READ, WRITE };
@@ -103,6 +117,16 @@ struct IOReq {
                  uint32_t size,
                  void* data,
                  std::optional<int> placeHandle = std::nullopt);
+
+  // HybridFDP: a single op on the backing file of @engineFile; @offset is
+  // relative to that file and no placement handle is sent.
+  explicit IOReq(IoContext& context_,
+                 const std::vector<folly::File>& fvec,
+                 OpType opType,
+                 uint64_t offset,
+                 uint32_t size,
+                 void* data,
+                 EngineFile engineFile);
 
   const char* getOpName() const {
     switch (opType_) {
@@ -175,6 +199,18 @@ class IoContext {
                                      uint32_t size,
                                      const void* data,
                                      int placeHandle);
+
+  // HybridFDP: create and submit a read/write req on one engine's file
+  std::shared_ptr<IOReq> submitRead(const std::vector<folly::File>& fvec,
+                                    uint64_t offset,
+                                    uint32_t size,
+                                    void* data,
+                                    EngineFile engineFile);
+  std::shared_ptr<IOReq> submitWrite(const std::vector<folly::File>& fvec,
+                                     uint64_t offset,
+                                     uint32_t size,
+                                     const void* data,
+                                     EngineFile engineFile);
 
   // Submit a IOOp to the device; should not fail for AsyncIoContext
   virtual bool submitIo(IOOp& op) = 0;
@@ -281,7 +317,8 @@ class AsyncIoContext : public IoContext {
 };
 
 // An FileDevice manages direct I/O to either a single or multiple (RAID0)
-// block device(s) or regular file(s).
+// block device(s) or regular file(s). In HybridFDP mode (perEngineFiles) the
+// files are not striped: file 0 backs BigHash and file 1 backs BlockCache.
 class FileDevice : public Device {
  public:
   FileDevice(std::vector<folly::File>&& fvec,
@@ -293,10 +330,12 @@ class FileDevice : public Device {
              uint32_t maxDeviceWriteSize,
              IoEngine ioEngine,
              uint32_t qDepthPerContext,
-             std::shared_ptr<DeviceEncryptor> encryptor);
+             std::shared_ptr<DeviceEncryptor> encryptor,
+             bool perEngineFiles);
 
   FileDevice(const FileDevice&) = delete;
   FileDevice& operator=(const FileDevice&) = delete;
+  ~FileDevice() override;
 
  private:
   IoContext* getIoContext();
@@ -306,6 +345,15 @@ class FileDevice : public Device {
   bool readImpl(uint64_t, uint32_t, void*) override;
 
   void flushImpl() override;
+
+  bool writeEngineFileImpl(uint64_t,
+                           uint32_t,
+                           const void*,
+                           EngineFile) override;
+
+  bool readEngineFileImpl(uint64_t, uint32_t, void*, EngineFile) override;
+
+  void flushEngineFileImpl(EngineFile) override;
 
   int allocatePlacementHandle() override;
 
@@ -336,6 +384,10 @@ class FileDevice : public Device {
   const uint32_t qDepthPerContext_;
 
   AtomicCounter numProcessed_{0};
+
+  // HybridFDP: bytes written to each engine file (indexed by EngineFile),
+  // printed when the device is destroyed. Both stay 0 in the other modes.
+  std::atomic<uint64_t> engineFileBytesWritten_[2]{};
 
   friend class IoContext;
 };
@@ -380,19 +432,43 @@ class MemoryDevice final : public Device {
 } // namespace
 
 bool Device::write(uint64_t offset, BufferView view, int placeHandle) {
+  return writeBufferView(offset, view, placeHandle, std::nullopt);
+}
+
+bool Device::write(uint64_t offset, Buffer buffer, int placeHandle) {
+  return writeBuffer(offset, std::move(buffer), placeHandle, std::nullopt);
+}
+
+bool Device::write(uint64_t offset, BufferView view, EngineFile file) {
+  XDCHECK(usesPerEngineFiles());
+  return writeBufferView(offset, view, -1 /* placeHandle */, file);
+}
+
+bool Device::write(uint64_t offset, Buffer buffer, EngineFile file) {
+  XDCHECK(usesPerEngineFiles());
+  return writeBuffer(offset, std::move(buffer), -1 /* placeHandle */, file);
+}
+
+bool Device::writeBufferView(uint64_t offset,
+                             BufferView view,
+                             int placeHandle,
+                             std::optional<EngineFile> engineFile) {
   if (encryptor_) {
-    auto writeBuffer = makeIOBuffer(view.size());
-    writeBuffer.copyFrom(0, view);
-    return write(offset, std::move(writeBuffer), placeHandle);
+    auto buffer = makeIOBuffer(view.size());
+    buffer.copyFrom(0, view);
+    return writeBuffer(offset, std::move(buffer), placeHandle, engineFile);
   }
 
   const auto size = view.size();
   XDCHECK_LE(offset + size, size_);
   const uint8_t* data = reinterpret_cast<const uint8_t*>(view.data());
-  return writeInternal(offset, data, size, placeHandle);
+  return writeInternal(offset, data, size, placeHandle, engineFile);
 }
 
-bool Device::write(uint64_t offset, Buffer buffer, int placeHandle) {
+bool Device::writeBuffer(uint64_t offset,
+                         Buffer buffer,
+                         int placeHandle,
+                         std::optional<EngineFile> engineFile) {
   const auto size = buffer.size();
   XDCHECK_LE(offset + buffer.size(), size_);
   uint8_t* data = reinterpret_cast<uint8_t*>(buffer.data());
@@ -405,13 +481,14 @@ bool Device::write(uint64_t offset, Buffer buffer, int placeHandle) {
       return false;
     }
   }
-  return writeInternal(offset, data, size, placeHandle);
+  return writeInternal(offset, data, size, placeHandle, engineFile);
 }
 
 bool Device::writeInternal(uint64_t offset,
                            const uint8_t* data,
                            size_t size,
-                           int placeHandle) {
+                           int placeHandle,
+                           std::optional<EngineFile> engineFile) {
   auto remainingSize = size;
   auto maxWriteSize = (maxWriteSize_ == 0) ? remainingSize : maxWriteSize_;
   bool result = true;
@@ -421,7 +498,7 @@ bool Device::writeInternal(uint64_t offset,
     XDCHECK_EQ(writeSize % ioAlignmentSize_, 0ul);
 
     auto timeBegin = getSteadyClock();
-    result = writeImpl(offset, writeSize, data, placeHandle);
+    result = writePiece(offset, writeSize, data, placeHandle, engineFile);
     writeLatencyEstimator_.trackValue(
         toMicros((getSteadyClock() - timeBegin)).count());
 
@@ -441,13 +518,39 @@ bool Device::writeInternal(uint64_t offset,
   return result;
 }
 
+bool Device::writePiece(uint64_t offset,
+                        size_t size,
+                        const uint8_t* data,
+                        int placeHandle,
+                        std::optional<EngineFile> engineFile) {
+  if (engineFile) {
+    return writeEngineFileImpl(offset, size, data, *engineFile);
+  }
+  if (!splitIoInChunks_) {
+    return writeImpl(offset, size, data, placeHandle);
+  }
+  // NOTE: the result of the last chunk is returned, see KNOWN_ISSUES (CL-14).
+  bool result = true;
+  while (size > 0) {
+    const auto chunkSize = std::min<size_t>(kIoChunkSize, size);
+    result = writeImpl(offset, chunkSize, data, placeHandle);
+    offset += chunkSize;
+    data += chunkSize;
+    size -= chunkSize;
+  }
+  return result;
+}
+
 // reads size number of bytes from the device from the offset into value.
 // Both offset and size are expected to be aligned for device IO operations.
 // If successful and encryptor_ is defined, size bytes from
 // validDataOffsetInValue offset in value are decrypted.
 //
 // returns true if successful, false otherwise.
-bool Device::readInternal(uint64_t offset, uint32_t size, void* value) {
+bool Device::readInternal(uint64_t offset,
+                          uint32_t size,
+                          void* value,
+                          std::optional<EngineFile> engineFile) {
   XDCHECK_EQ(reinterpret_cast<uint64_t>(value) % ioAlignmentSize_, 0ul);
   XDCHECK_LE(offset + size, size_);
   uint8_t* data = reinterpret_cast<uint8_t*>(value);
@@ -461,7 +564,7 @@ bool Device::readInternal(uint64_t offset, uint32_t size, void* value) {
     XDCHECK_EQ(size % ioAlignmentSize_, 0ul);
 
     auto timeBegin = getSteadyClock();
-    result = readImpl(curOffset, readSize, data);
+    result = readPiece(curOffset, readSize, data, engineFile);
     readLatencyEstimator_.trackValue(
         toMicros(getSteadyClock() - timeBegin).count());
 
@@ -487,6 +590,28 @@ bool Device::readInternal(uint64_t offset, uint32_t size, void* value) {
   return result;
 }
 
+bool Device::readPiece(uint64_t offset,
+                       size_t size,
+                       uint8_t* data,
+                       std::optional<EngineFile> engineFile) {
+  if (engineFile) {
+    return readEngineFileImpl(offset, size, data, *engineFile);
+  }
+  if (!splitIoInChunks_) {
+    return readImpl(offset, size, data);
+  }
+  // NOTE: the result of the last chunk is returned, see KNOWN_ISSUES (CL-14).
+  bool result = true;
+  while (size > 0) {
+    const auto chunkSize = std::min<size_t>(kIoChunkSize, size);
+    result = readImpl(offset, chunkSize, data);
+    offset += chunkSize;
+    data += chunkSize;
+    size -= chunkSize;
+  }
+  return result;
+}
+
 // This API reads size bytes from the Device from offset into a Buffer and
 // returns the Buffer. If offset and size are not aligned to device's
 // ioAlignmentSize_, IO aligned offset and IO aligned size are determined
@@ -496,6 +621,17 @@ bool Device::readInternal(uint64_t offset, uint32_t size, void* value) {
 // An empty buffer is returned in case of error and the caller must check
 // the buffer size returned with size passed in to check for errors.
 Buffer Device::read(uint64_t offset, uint32_t size) {
+  return readBuffer(offset, size, std::nullopt);
+}
+
+Buffer Device::read(uint64_t offset, uint32_t size, EngineFile file) {
+  XDCHECK(usesPerEngineFiles());
+  return readBuffer(offset, size, file);
+}
+
+Buffer Device::readBuffer(uint64_t offset,
+                          uint32_t size,
+                          std::optional<EngineFile> engineFile) {
   XDCHECK_LE(offset + size, size_);
   uint64_t readOffset =
       offset & ~(static_cast<uint64_t>(ioAlignmentSize_) - 1ul);
@@ -503,7 +639,7 @@ Buffer Device::read(uint64_t offset, uint32_t size) {
       offset & (static_cast<uint64_t>(ioAlignmentSize_) - 1ul);
   auto readSize = getIOAlignedSize(readPrefixSize + size);
   auto buffer = makeIOBuffer(readSize);
-  bool result = readInternal(readOffset, readSize, buffer.data());
+  bool result = readInternal(readOffset, readSize, buffer.data(), engineFile);
   if (!result) {
     return Buffer{};
   }
@@ -517,6 +653,25 @@ Buffer Device::read(uint64_t offset, uint32_t size) {
 bool Device::read(uint64_t offset, uint32_t size, void* value) {
   return readInternal(offset, size, value);
 }
+
+bool Device::read(uint64_t offset,
+                  uint32_t size,
+                  void* value,
+                  EngineFile file) {
+  XDCHECK(usesPerEngineFiles());
+  return readInternal(offset, size, value, file);
+}
+
+bool Device::writeEngineFileImpl(uint64_t, uint32_t, const void*, EngineFile) {
+  throw std::logic_error("this device has no per-engine files");
+}
+
+bool Device::readEngineFileImpl(uint64_t, uint32_t, void*, EngineFile) {
+  throw std::logic_error("this device has no per-engine files");
+}
+
+// Flushing the whole device also flushes every engine's data.
+void Device::flushEngineFileImpl(EngineFile) { flushImpl(); }
 
 void Device::getCounters(const CounterVisitor& visitor) const {
   visitor("navy_device_bytes_written", getBytesWritten(),
@@ -551,13 +706,9 @@ std::string IOOp::toString() const {
 bool IOOp::done(ssize_t len) {
   XDCHECK(parent_.opType_ == READ || parent_.opType_ == WRITE);
 
+  // NOTE: upstream logs failed IOs here (rate limited); the log is silenced
+  // in this fork, see KNOWN_ISSUES (CL-14).
   bool result = (len == size_);
-  if (!result) {
-    // Report IO errors
-    XLOG_N_PER_MS(ERR, 10, 1000) << folly::sformat(
-        "[{}] IO error: {} len={} errno={} ({})", parent_.context_.getName(),
-        toString(), len, errno, std::strerror(errno));
-  }
 
   // Check for timeout
   auto curTime = getSteadyClock();
@@ -615,6 +766,29 @@ IOReq::IOReq(IoContext& context,
     ops_.emplace_back(*this, idx++, fvec[0].fd(), offset_, size_, data_,
                       placeHandle_);
   }
+
+  numRemaining_ = ops_.size();
+}
+
+IOReq::IOReq(IoContext& context,
+             const std::vector<folly::File>& fvec,
+             OpType opType,
+             uint64_t offset,
+             uint32_t size,
+             void* data,
+             EngineFile engineFile)
+    : context_(context),
+      opType_(opType),
+      offset_(offset),
+      size_(size),
+      data_(data) {
+  if (fvec.size() < 2) {
+    throw std::invalid_argument(folly::sformat(
+        "HybridFDP IO needs one file per engine, but the device has {} file(s)",
+        fvec.size()));
+  }
+  ops_.emplace_back(*this, 0, fvec[static_cast<size_t>(engineFile)].fd(),
+                    offset_, size_, data_);
 
   numRemaining_ = ops_.size();
 }
@@ -694,6 +868,30 @@ std::shared_ptr<IOReq> IoContext::submitWrite(
   auto req =
       std::make_shared<IOReq>(*this, fvec, stripeSize, OpType::WRITE, offset,
                               size, const_cast<void*>(data), placeHandle);
+  submitReq(req);
+  return req;
+}
+
+std::shared_ptr<IOReq> IoContext::submitRead(
+    const std::vector<folly::File>& fvec,
+    uint64_t offset,
+    uint32_t size,
+    void* data,
+    EngineFile engineFile) {
+  auto req = std::make_shared<IOReq>(*this, fvec, OpType::READ, offset, size,
+                                     data, engineFile);
+  submitReq(req);
+  return req;
+}
+
+std::shared_ptr<IOReq> IoContext::submitWrite(
+    const std::vector<folly::File>& fvec,
+    uint64_t offset,
+    uint32_t size,
+    const void* data,
+    EngineFile engineFile) {
+  auto req = std::make_shared<IOReq>(*this, fvec, OpType::WRITE, offset, size,
+                                     const_cast<void*>(data), engineFile);
   submitReq(req);
   return req;
 }
@@ -925,19 +1123,22 @@ FileDevice::FileDevice(std::vector<folly::File>&& fvec,
                        uint32_t maxDeviceWriteSize,
                        IoEngine ioEngine,
                        uint32_t qDepthPerContext,
-                       std::shared_ptr<DeviceEncryptor> encryptor)
+                       std::shared_ptr<DeviceEncryptor> encryptor,
+                       bool perEngineFiles)
     : Device(fileSize * fvec.size(),
              std::move(encryptor),
              blockSize,
              maxIOSize,
-             maxDeviceWriteSize),
+             maxDeviceWriteSize,
+             perEngineFiles,
+             ioEngine != IoEngine::Sync /* splitIoInChunks */),
       fvec_(std::move(fvec)),
       fdpNvmeVec_(std::move(fdpNvmeVec)),
       stripeSize_(stripeSize),
       ioEngine_(ioEngine),
       qDepthPerContext_(qDepthPerContext) {
   XDCHECK_GT(blockSize, 0u);
-  if (fvec_.size() > 1) {
+  if (fvec_.size() > 1 && !perEngineFiles) {
     XDCHECK_GT(stripeSize_, 0u);
     XDCHECK_GE(stripeSize_, blockSize);
     XDCHECK_EQ(0u, stripeSize_ % 2) << stripeSize_;
@@ -972,6 +1173,16 @@ FileDevice::FileDevice(std::vector<folly::File>&& fvec,
       fdpNvmeVec_.size());
 }
 
+FileDevice::~FileDevice() {
+  // Experiment output, keep the format: bytes written to the SOC and the LOC
+  // file in HybridFDP mode.
+  printf("\n~~~~~~~~~~~~~~~~~~~~FileDevice\n");
+  for (const auto& bytesWritten : engineFileBytesWritten_) {
+    printf("%lu ", bytesWritten.load());
+  }
+  printf("\n");
+}
+
 bool FileDevice::readImpl(uint64_t offset, uint32_t size, void* value) {
   auto req =
       getIoContext()->submitRead(fvec_, stripeSize_, offset, size, value);
@@ -991,6 +1202,31 @@ void FileDevice::flushImpl() {
   for (const auto& f : fvec_) {
     ::fsync(f.fd());
   }
+}
+
+bool FileDevice::readEngineFileImpl(uint64_t offset,
+                                    uint32_t size,
+                                    void* value,
+                                    EngineFile file) {
+  auto req = getIoContext()->submitRead(fvec_, offset, size, value, file);
+  return req->waitCompletion();
+}
+
+bool FileDevice::writeEngineFileImpl(uint64_t offset,
+                                     uint32_t size,
+                                     const void* value,
+                                     EngineFile file) {
+  engineFileBytesWritten_[static_cast<size_t>(file)].fetch_add(size);
+  auto req = getIoContext()->submitWrite(fvec_, offset, size, value, file);
+  return req->waitCompletion();
+}
+
+void FileDevice::flushEngineFileImpl(EngineFile file) {
+  if (!usesPerEngineFiles()) {
+    flushImpl();
+    return;
+  }
+  ::fsync(fvec_[static_cast<size_t>(file)].fd());
 }
 
 IoContext* FileDevice::getIoContext() {
@@ -1072,33 +1308,37 @@ int FileDevice::allocatePlacementHandle() {
 }
 
 // Open cache file @fileName and set it size to @size.
+// The file is opened with O_DIRECT if @useDirectIo is set, otherwise for
+// buffered IO through the page cache.
 // Throws std::system_error if failed.
 folly::File openCacheFile(const std::string& fileName,
                           uint64_t size,
                           bool truncate,
-                          bool isExclusiveOwner) {
+                          bool isExclusiveOwner,
+                          bool useDirectIo) {
   XLOG(INFO) << "Cache file: " << fileName << " size: " << size
-             << " truncate: " << truncate;
+             << " truncate: " << truncate << " direct_io: " << useDirectIo;
   if (fileName.empty()) {
     throw std::invalid_argument("File name is empty");
   }
 
-  const int flags{O_RDWR | O_CREAT | (isExclusiveOwner ? O_EXCL : 0)};
-  // try opening with o_direct. For tests, we might get a file on tmpfs that
-  // might not support o_direct. Hence, we might have to default to avoiding
-  // o_direct in those cases.
+  const int flags{O_RDWR | O_CREAT | (isExclusiveOwner ? O_EXCL : 0) |
+                  (useDirectIo ? O_DIRECT : 0)};
   folly::File f;
 
   try {
-    f = folly::File(fileName.c_str(), flags | O_DIRECT);
+    f = folly::File(fileName.c_str(), flags);
   } catch (const std::system_error& e) {
-    if (e.code().value() == EINVAL) {
-      XLOG(ERR) << "Failed to open with o-direct, trying without. Error: "
+    // Unlike upstream, there is no silent fallback to buffered IO when the
+    // file system rejects O_DIRECT: the IO mode is an experiment parameter
+    // and has to be selected explicitly.
+    if (useDirectIo && e.code().value() == EINVAL) {
+      XLOG(ERR) << "Failed to open " << fileName
+                << " with O_DIRECT; buffered IO must be configured "
+                   "explicitly. Error: "
                 << e.what();
-      f = folly::File(fileName.c_str(), flags);
-    } else {
-      throw;
     }
+    throw;
   }
   XDCHECK_GE(f.fd(), 0);
 
@@ -1155,6 +1395,22 @@ folly::File openCacheFile(const std::string& fileName,
   }
 #endif
 
+  // CoFDP HybridFDP: pin the small object cache file ("navy_cache0") so that
+  // F2FS updates it in place and its GC skips the file. The UserFDP raw
+  // device is excluded; on other file systems the ioctl fails and only a
+  // warning is logged.
+  // NOTE: the file is selected by name, see KNOWN_ISSUES (CL-17).
+  const bool isUserFdpDevice =
+      fileName == "/dev/nvme0n1" || fileName == "/dev/ng0n1";
+  if (!isUserFdpDevice && fileName.find("navy_cache0") != std::string::npos) {
+    uint32_t pin = 1;
+    if (::ioctl(f.fd(), F2FS_IOC_SET_PIN_FILE, &pin) < 0) {
+      XLOGF(WARN, "Cache file {}: F2FS_IOC_SET_PIN_FILE failed: {}", fileName,
+            std::strerror(errno));
+    } else {
+      XLOGF(INFO, "Cache file {} is SET to PIN_FILE", fileName);
+    }
+  }
   return f;
 }
 } // namespace
@@ -1177,13 +1433,16 @@ std::unique_ptr<Device> createDirectIoFileDevice(
     IoEngine ioEngine,
     uint32_t qDepthPerContext,
     bool isFDPEnabled,
-    std::shared_ptr<DeviceEncryptor> encryptor) {
+    std::shared_ptr<DeviceEncryptor> encryptor,
+    bool perEngineFiles) {
   XDCHECK(folly::isPowTwo(blockSize));
 
   uint32_t maxIOSize = maxDeviceWriteSize;
   std::vector<std::shared_ptr<FdpNvme>> fdpNvmeVec{};
 #ifndef CACHELIB_IOURING_DISABLE
-  if (isFDPEnabled) {
+  // In HybridFDP mode placement comes from the P-Directories of the files,
+  // so NVMe FDP passthrough is not used even if FDP is enabled.
+  if (isFDPEnabled && !perEngineFiles) {
     try {
       if (filePaths.size() > 1) {
         throw std::invalid_argument(folly::sformat(
@@ -1224,7 +1483,8 @@ std::unique_ptr<Device> createDirectIoFileDevice(
                                       maxDeviceWriteSize,
                                       ioEngine,
                                       qDepthPerContext,
-                                      encryptor);
+                                      encryptor,
+                                      perEngineFiles);
 }
 
 std::unique_ptr<Device> createDirectIoFileDevice(
@@ -1257,12 +1517,16 @@ std::unique_ptr<Device> createFileDevice(
     uint32_t qDepth,
     bool isFDPEnabled,
     std::shared_ptr<navy::DeviceEncryptor> encryptor,
-    bool isExclusiveOwner) {
+    bool isExclusiveOwner,
+    bool perEngineFiles,
+    bool useDirectIo) {
   // File paths are opened in the increasing order of the
   // path string. This ensures that RAID0 stripes aren't
   // out of order even if the caller changes the order of
   // the file paths. We can recover the cache as long as all
   // the paths are specified, regardless of the order.
+  // In HybridFDP mode the first path in this order backs BigHash and the
+  // second one BlockCache.
 
   std::sort(filePaths.begin(), filePaths.end());
   std::vector<folly::File> fileVec;
@@ -1270,7 +1534,8 @@ std::unique_ptr<Device> createFileDevice(
     folly::File f;
     try {
       // TODO: beyondsora implement
-      f = openCacheFile(path, fdSize, truncateFile, isExclusiveOwner);
+      f = openCacheFile(path, fdSize, truncateFile, isExclusiveOwner,
+                        useDirectIo);
     } catch (const std::exception& e) {
       XLOG(ERR) << "Exception in openCacheFile(" << path << "): " << e.what()
                 << ". Errno: " << errno;
@@ -1288,6 +1553,7 @@ std::unique_ptr<Device> createFileDevice(
                                   ioEngine,
                                   qDepth,
                                   isFDPEnabled,
-                                  std::move(encryptor));
+                                  std::move(encryptor),
+                                  perEngineFiles);
 }
 } // namespace facebook::cachelib::navy

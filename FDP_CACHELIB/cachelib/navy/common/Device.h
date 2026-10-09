@@ -19,6 +19,8 @@
 #include <folly/File.h>
 #include <folly/io/IOBuf.h>
 
+#include <optional>
+
 #include "cachelib/allocator/nvmcache/NavyConfig.h"
 #include "cachelib/common/AtomicCounter.h"
 #include "cachelib/common/PercentileStats.h"
@@ -51,6 +53,20 @@ class DeviceEncryptor {
   // @param salt    this must be the same earlier used for encryption
   // @return        true if success, false otherwise
   virtual bool decrypt(folly::MutableByteRange value, uint64_t salt) = 0;
+};
+
+// CoFDP HybridFDP mode: instead of a single file (or a RAID-0 set of files),
+// a device can be backed by one file per Navy engine, each created in its own
+// directory. With CoFDP the directories are P-Directories of a PiDir-FS
+// (F2FS/XFS) mount, so the kernel tags the writes of each engine with the PIDs
+// of its directory; CacheLib itself sends no PID in this mode.
+//
+// Offsets passed with an EngineFile are relative to that engine's file.
+enum class EngineFile : uint8_t {
+  // BigHash, i.e. the small object cache (SOC)
+  kSmallObjectCache = 0,
+  // BlockCache, i.e. the large object cache (LOC)
+  kLargeObjectCache = 1,
 };
 
 // Device abstraction
@@ -88,21 +104,29 @@ class Device {
                0 /* max device IO size */,
                maxWriteSize) {}
 
-  // @param size          total size of the device
-  // @param encryptor     encryption object
-  // @param ioAlignSize   alignment size for IO operations
-  // @param maxIOSize     max device IO size
-  // @param maxWriteSize  max device write size
+  // @param size            total size of the device
+  // @param encryptor       encryption object
+  // @param ioAlignSize     alignment size for IO operations
+  // @param maxIOSize       max device IO size
+  // @param maxWriteSize    max device write size
+  // @param perEngineFiles  one backing file per engine (HybridFDP, see
+  //                        EngineFile)
+  // @param splitIoInChunks issue every read/write piece as consecutive
+  //                        kIoChunkSize device IOs (see splitIoInChunks_)
   Device(uint64_t size,
          std::shared_ptr<DeviceEncryptor> encryptor,
          uint32_t ioAlignSize,
          uint32_t maxIOSize,
-         uint32_t maxWriteSize)
+         uint32_t maxWriteSize,
+         bool perEngineFiles = false,
+         bool splitIoInChunks = false)
       : size_(size),
         ioAlignmentSize_{ioAlignSize},
         maxIOSize_(maxIOSize),
         maxWriteSize_(maxWriteSize),
-        encryptor_{std::move(encryptor)} {
+        encryptor_{std::move(encryptor)},
+        perEngineFiles_{perEngineFiles},
+        splitIoInChunks_{splitIoInChunks} {
     if (ioAlignSize == 0) {
       throw std::invalid_argument(
           folly::sformat("Invalid ioAlignSize {}", ioAlignSize, size));
@@ -147,6 +171,12 @@ class Device {
   // entryptor is present.
   bool write(uint64_t offset, BufferView bufferView, int placeHandle = -1);
 
+  // HybridFDP variants of the two writes above: the data goes to the backing
+  // file of @file at the engine-relative @offset. Requires
+  // usesPerEngineFiles().
+  bool write(uint64_t offset, Buffer buffer, EngineFile file);
+  bool write(uint64_t offset, BufferView bufferView, EngineFile file);
+
   // Allocate a new stream and return the handle for Placement capable devices.
   virtual int allocatePlacementHandle() = 0;
 
@@ -164,8 +194,19 @@ class Device {
   // bytes from offset.
   Buffer read(uint64_t offset, uint32_t size);
 
+  // HybridFDP variants of the two reads above: the data is read from the
+  // backing file of @file at the engine-relative @offset. Requires
+  // usesPerEngineFiles().
+  bool read(uint64_t offset, uint32_t size, void* value, EngineFile file);
+  Buffer read(uint64_t offset, uint32_t size, EngineFile file);
+
   // Everything should be on device after this call returns.
   void flush() { flushImpl(); }
+
+  // HybridFDP: everything written to the backing file of @file should be on
+  // device after this call returns. Without per-engine files, this flushes
+  // the whole device like flush().
+  void flush(EngineFile file) { flushEngineFileImpl(file); }
 
   // Return bytes written since device start
   uint64_t getBytesWritten() const { return bytesWritten_.get(); }
@@ -182,6 +223,10 @@ class Device {
   // Returns the alignment size for device io operations
   uint32_t getIOAlignmentSize() const { return ioAlignmentSize_; }
 
+  // Whether the device has one backing file per engine (HybridFDP). The
+  // engines then use the EngineFile variants of write/read/flush.
+  bool usesPerEngineFiles() const { return perEngineFiles_; }
+
  protected:
   virtual bool writeImpl(uint64_t offset,
                          uint32_t size,
@@ -190,7 +235,24 @@ class Device {
   virtual bool readImpl(uint64_t offset, uint32_t size, void* value) = 0;
   virtual void flushImpl() = 0;
 
+  // HybridFDP IO on the backing file of one engine (see EngineFile). FileDevice
+  // overrides the read and write hooks, which are called only when
+  // usesPerEngineFiles(); other devices keep the defaults, which throw
+  // std::logic_error. The default flush hook flushes the whole device.
+  virtual bool writeEngineFileImpl(uint64_t offset,
+                                   uint32_t size,
+                                   const void* value,
+                                   EngineFile file);
+  virtual bool readEngineFileImpl(uint64_t offset,
+                                  uint32_t size,
+                                  void* value,
+                                  EngineFile file);
+  virtual void flushEngineFileImpl(EngineFile file);
+
  private:
+  // Size of each device IO when splitIoInChunks_ is set (512 KiB).
+  static constexpr uint32_t kIoChunkSize{512 * 1024};
+
   mutable AtomicCounter bytesWritten_;
   mutable AtomicCounter bytesRead_;
   mutable AtomicCounter writeIOErrors_;
@@ -201,12 +263,43 @@ class Device {
   mutable util::PercentileStats readLatencyEstimator_;
   mutable util::PercentileStats writeLatencyEstimator_;
 
-  bool readInternal(uint64_t offset, uint32_t size, void* value);
+  // Shared implementation of the write/read APIs. @engineFile selects the
+  // backing file in HybridFDP mode; std::nullopt addresses the whole device.
+  // @placeHandle is only used for the whole device.
+  bool writeBuffer(uint64_t offset,
+                   Buffer buffer,
+                   int placeHandle,
+                   std::optional<EngineFile> engineFile);
+  bool writeBufferView(uint64_t offset,
+                       BufferView bufferView,
+                       int placeHandle,
+                       std::optional<EngineFile> engineFile);
+  Buffer readBuffer(uint64_t offset,
+                    uint32_t size,
+                    std::optional<EngineFile> engineFile);
+
+  bool readInternal(uint64_t offset,
+                    uint32_t size,
+                    void* value,
+                    std::optional<EngineFile> engineFile = std::nullopt);
 
   bool writeInternal(uint64_t offset,
                      const uint8_t* data,
                      size_t size,
-                     int placeHandle = -1);
+                     int placeHandle = -1,
+                     std::optional<EngineFile> engineFile = std::nullopt);
+
+  // Issue one piece (at most maxIOSize_/maxWriteSize_ bytes) of a
+  // readInternal/writeInternal call to the device.
+  bool readPiece(uint64_t offset,
+                 size_t size,
+                 uint8_t* data,
+                 std::optional<EngineFile> engineFile);
+  bool writePiece(uint64_t offset,
+                  size_t size,
+                  const uint8_t* data,
+                  int placeHandle,
+                  std::optional<EngineFile> engineFile);
 
   // size of the device. All offsets for write/read should be contained
   // below this.
@@ -227,6 +320,18 @@ class Device {
   const uint32_t maxWriteSize_{0};
 
   std::shared_ptr<DeviceEncryptor> encryptor_;
+
+  // HybridFDP: one backing file per engine (see EngineFile).
+  const bool perEngineFiles_{false};
+
+  // CoFDP UserFDP support: issue every read/write piece of the whole-device
+  // API as consecutive kIoChunkSize IOs. NVMe passthrough commands larger than
+  // 512 KiB fail because the kernel maps the user buffer page by page
+  // (NVME_MAX_SEGS x 4 KiB). Set by FileDevice for the asynchronous IO engines
+  // (io_uring/libaio), i.e. keyed on the engine rather than on passthrough.
+  // The HybridFDP (EngineFile) path never splits.
+  // NOTE: see KNOWN_ISSUES (CL-14) for the error handling of a split piece.
+  const bool splitIoInChunks_{false};
 
   static constexpr uint32_t kDefaultAlignmentSize{1};
 };
@@ -255,6 +360,9 @@ std::unique_ptr<Device> createMemoryDevice(
 //                              If 0, sync IO will be used
 // @param isFDPEnabled          Whether FDP placement mode is enabled or not.
 // @param encryptor             encryption object
+// @param perEngineFiles        HybridFDP: one file per engine instead of RAID
+//                              (file 0: BigHash, file 1: BlockCache). NVMe
+//                              FDP passthrough is not used in this mode.
 std::unique_ptr<Device> createDirectIoFileDevice(
     std::vector<folly::File> fVec,
     std::vector<std::string> filePaths,
@@ -265,7 +373,8 @@ std::unique_ptr<Device> createDirectIoFileDevice(
     IoEngine ioEngine,
     uint32_t qDepth,
     bool isFDPEnabled,
-    std::shared_ptr<DeviceEncryptor> encryptor);
+    std::shared_ptr<DeviceEncryptor> encryptor,
+    bool perEngineFiles = false);
 
 // A convenient wrapper for creating Device with a sync IO
 //
@@ -297,6 +406,11 @@ std::unique_ptr<Device> createDirectIoFileDevice(
 // @param isFDPEnabled          whether FDP placement mode enabled or not
 // @param encryptor             encryption object
 // @param isExclusiveOwner      fail if not sole owner of the file
+// @param perEngineFiles        HybridFDP: one file per engine instead of RAID.
+//                              The files are used in sorted path order (file
+//                              0: BigHash, file 1: BlockCache).
+// @param useDirectIo           open the files with O_DIRECT (default) or for
+//                              buffered IO through the page cache
 std::unique_ptr<Device> createFileDevice(
     std::vector<std::string> filePaths,
     uint64_t fileSize,
@@ -308,7 +422,9 @@ std::unique_ptr<Device> createFileDevice(
     uint32_t qDepth,
     bool isFDPEnabled,
     std::shared_ptr<navy::DeviceEncryptor> encryptor,
-    bool isExclusiveOwner);
+    bool isExclusiveOwner,
+    bool perEngineFiles = false,
+    bool useDirectIo = true);
 } // namespace navy
 } // namespace cachelib
 } // namespace facebook

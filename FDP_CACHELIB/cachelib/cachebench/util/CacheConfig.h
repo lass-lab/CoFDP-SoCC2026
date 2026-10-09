@@ -230,6 +230,17 @@ struct CacheConfig : public JSONConfig {
   // Enable the FDP Data placement mode in the device, if it is capable.
   bool deviceEnableFDP{false};
 
+  // CoFDP HybridFDP: with more than one entry in nvmCachePaths, every entry
+  // must be a directory (with CoFDP, a P-Directory). The cache file
+  // <entry i>/navy_cache<i> of nvmCacheSizeMB is created in each, and Navy
+  // uses one file per engine instead of RAID-0: the first file in sorted path
+  // order backs BigHash (SOC), the second one BlockCache (LOC).
+  bool enableHyBridFDP{false};
+
+  // CoFDP: open the Navy cache files and devices with O_DIRECT (true,
+  // upstream behaviour) or for buffered IO through the page cache (false).
+  bool navyFileDirectIO{true};
+
   // Don't write to flash if cache TTL is smaller than this value.
   // Not used when its value is 0.  In seconds.
   uint32_t memoryOnlyTTL{0};

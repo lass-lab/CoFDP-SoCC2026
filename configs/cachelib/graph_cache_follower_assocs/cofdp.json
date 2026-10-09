@@ -1,0 +1,65 @@
+{
+  "cache_config": {
+    "cacheSizeMB": 440,
+    "allocFactor": 1.5,
+    "maxAllocSize": 1048576,
+    "minAllocSize": 64,
+  
+    // "navyQDepth": 32,
+    // "navySegmentedFifoSegmentRatio" : [1],
+    "navyReaderThreads": 2,
+    "navyWriterThreads": 2,
+    "deviceMaxWriteSize": 16777216,
+  
+    "nvmCachePaths": ["/home/femu/f2fs_fdp_mount/pp0pp2pp4pp6", 
+    "/home/femu/f2fs_fdp_mount/pp1pp3pp5pp7"],
+    "writeAmpDeviceList": [
+      "nvme0n1"
+    ],
+  
+    "navyRegionSizeMB" : 512,
+  
+  
+    "navyBigHashBucketSize": 4096,
+    "navyBigHashSizePct": 50,
+    "navySmallItemMaxSize": 2048,
+    "navyBlockSize": 4096,
+    "navyParcelMemoryMB": 2048,
+    "nvmCacheSizeMB": 6144,
+    "htBucketPower": 22,
+    "moveOnSlabRelease": true,
+    "poolRebalanceIntervalSec": 2,
+    "rebalanceStrategy": "hits",
+    "rebalanceMinRatio": 0.1,
+    "rebalanceMinSlabs": 2,
+    "navyNumInmemBuffers": 30,
+  
+    "navyFileDirectIO": false,
+    "enableHyBridFDP": true
+  },
+  "test_config": 
+    {
+      "addChainedRatio": 0.0, 
+      "delRatio": 0.0, 
+      "enableLookaside": true, 
+      "getRatio": 0.9746082749830369, 
+      "keySizeRange": [
+        1, 
+        8, 
+        64
+      ], 
+      "keySizeRangeProbability": [
+        0.3, 
+        0.7
+      ], 
+      "loneGetRatio": 0.025391725016963105, 
+      "numKeys": 23458726, 
+      "numOps": 5000000, 
+      "numThreads": 48, 
+      "popDistFile": "pop.json", 
+       
+      "setRatio": 0.0, 
+      "valSizeDistFile": "sizes.json"
+    }
+ 
+}

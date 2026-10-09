@@ -19,16 +19,11 @@ namespace cachelib {
 namespace cachebench {
 template <typename Allocator>
 uint64_t Cache<Allocator>::fetchNandWrites() const {
-  size_t total = 0;
-  for (const auto& d : config_.writeAmpDeviceList) {
-    try {
-      total += facebook::hw::nandWriteBytes(d);
-    } catch (const std::exception& e) {
-      XLOGF(ERR, "Exception fetching nand writes for {}. Msg: {}", d, e.what());
-      return 0;
-    }
-  }
-  return total;
+  // CoFDP: NAND writes are not queried from the devices in writeAmpDeviceList,
+  // so the "NVM bytes written (nand)" and "NVM dev write amplification" lines
+  // report 0. On the emulated FDP SSD the write amplification is computed
+  // from the emulator's own counters instead.
+  return 0;
 }
 
 template <typename Allocator>
@@ -153,6 +148,31 @@ Cache<Allocator>::Cache(const CacheConfig& config,
         nvmConfig.navyConfig.setSimpleFile(path, config_.nvmCacheSizeMB * MB,
                                            !isBlk /* truncateFile */);
       }
+    } else if (config_.nvmCachePaths.size() > 1 && config_.enableHyBridFDP) {
+      // CoFDP HybridFDP: one cache file per engine, created in each of the
+      // given directories (P-Directories) and fallocated to nvmCacheSizeMB.
+      std::vector<std::string> filePaths;
+      for (size_t i = 0; i < config_.nvmCachePaths.size(); i++) {
+        const auto& dir = config_.nvmCachePaths[i];
+        bool isDir = false;
+        try {
+          isDir = cachelib::util::isDir(dir);
+        } catch (const std::system_error&) {
+          XLOGF(INFO, "nvmCachePath {} does not exist", dir);
+        }
+        if (!isDir) {
+          throw std::invalid_argument(folly::sformat(
+              "enableHyBridFDP: nvmCachePath {} is not a directory", dir));
+        }
+        filePaths.push_back(dir + "/navy_cache" + std::to_string(i));
+      }
+      XLOGF(INFO,
+            "Configuring NVM cache: one file per engine ({} files) size {} MB "
+            "each",
+            filePaths.size(), config_.nvmCacheSizeMB);
+      nvmConfig.navyConfig.setPerEngineFiles(std::move(filePaths),
+                                             config_.nvmCacheSizeMB * MB,
+                                             true /* truncateFile */);
     } else if (config_.nvmCachePaths.size() > 1) {
       XLOGF(INFO, "Configuring NVM cache: RAID-0 ({} devices) size {} MB",
             config_.nvmCachePaths.size(), config_.nvmCacheSizeMB);
@@ -174,13 +194,17 @@ Cache<Allocator>::Cache(const CacheConfig& config,
     }
     nvmConfig.navyConfig.setBlockSize(config_.navyBlockSize);
     nvmConfig.navyConfig.setEnableFDP(config_.deviceEnableFDP);
+    nvmConfig.navyConfig.setEnableHybridFDP(config_.enableHyBridFDP);
+    nvmConfig.navyConfig.setDirectIo(config_.navyFileDirectIO);
 
     // configure BlockCache
+    // CoFDP: navyNumInmemBuffers is applied (upstream parses but ignores it).
     auto& bcConfig = nvmConfig.navyConfig.blockCache()
                          .setDataChecksum(config_.navyDataChecksum)
                          .setCleanRegions(config_.navyCleanRegions,
                                           config_.navyCleanRegionThreads)
-                         .setRegionSize(config_.navyRegionSizeMB * MB);
+                         .setRegionSize(config_.navyRegionSizeMB * MB)
+                         .setNumInMemBuffers(config_.navyNumInmemBuffers);
 
     // by default lru. if more than one fifo ratio is present, we use
     // segmented fifo. otherwise, simple fifo.
@@ -753,8 +777,11 @@ Stats Cache<Allocator>::getStats() const {
     double bcLogicalBytes = lookup("navy_bc_logical_written");
     ret.numNvmLogicalBytesWritten =
         static_cast<size_t>(bhLogicalBytes + bcLogicalBytes);
+    ret.nvmReadLatencyMicrosAvg = lookup("navy_device_read_latency_us_avg");
+    ret.nvmWriteLatencyMicrosAvg = lookup("navy_device_write_latency_us_avg");
     ret.nvmReadLatencyMicrosP50 = lookup("navy_device_read_latency_us_p50");
     ret.nvmReadLatencyMicrosP90 = lookup("navy_device_read_latency_us_p90");
+    ret.nvmReadLatencyMicrosP95 = lookup("navy_device_read_latency_us_p95");
     ret.nvmReadLatencyMicrosP99 = lookup("navy_device_read_latency_us_p99");
     ret.nvmReadLatencyMicrosP999 = lookup("navy_device_read_latency_us_p999");
     ret.nvmReadLatencyMicrosP9999 = lookup("navy_device_read_latency_us_p9999");
@@ -765,6 +792,7 @@ Stats Cache<Allocator>::getStats() const {
     ret.nvmReadLatencyMicrosP100 = lookup("navy_device_read_latency_us_p100");
     ret.nvmWriteLatencyMicrosP50 = lookup("navy_device_write_latency_us_p50");
     ret.nvmWriteLatencyMicrosP90 = lookup("navy_device_write_latency_us_p90");
+    ret.nvmWriteLatencyMicrosP95 = lookup("navy_device_write_latency_us_p95");
     ret.nvmWriteLatencyMicrosP99 = lookup("navy_device_write_latency_us_p99");
     ret.nvmWriteLatencyMicrosP999 = lookup("navy_device_write_latency_us_p999");
     ret.nvmWriteLatencyMicrosP9999 =

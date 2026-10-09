@@ -173,7 +173,8 @@ class RegionManager {
       std::lock_guard<TimedMutex> bufLock{bufferMutex_};
       buffers_.push_back(std::move(buf));
       if (bufferCond_.numWaiters() > 0) {
-        bufferCond_.notifyAll();
+        // CoFDP: wake one waiter per returned buffer (upstream: notifyAll).
+        bufferCond_.notifyOne();
       }
     }
     numInMemBufActive_.dec();

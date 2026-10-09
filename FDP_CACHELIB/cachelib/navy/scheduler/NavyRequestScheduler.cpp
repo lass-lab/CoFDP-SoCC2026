@@ -189,20 +189,14 @@ void NavyRequestScheduler::checkHealth(
     auto stat = dispatchers[i]->getStats();
     auto& lastStat = lastStats[i];
     auto numQueued = stat.numSubmitted - lastStat.numDispatched;
-    auto numPolled = stat.numPolled - lastStat.numPolled;
+    // CoFDP: upstream logs a stalled dispatch or a stalled IO as an error here
+    // (and a failed health check below). These error logs are disabled in
+    // this fork; the checks still mark the scheduler as unhealthy.
     if (numQueued > 0 && lastStat.numDispatched == stat.numDispatched) {
-      XLOGF(ERR,
-            "[{}] dispatch stalled. polled {} submitted {} -> {} dispatched "
-            "{} -> {}",
-            dispatchers[i]->getName(), numPolled, lastStat.numSubmitted,
-            stat.numSubmitted, lastStat.numDispatched, stat.numDispatched);
       healthy = false;
     }
     if (lastStat.curOutstanding > 0 &&
         lastStat.numCompleted == stat.numCompleted) {
-      XLOGF(ERR, "[{}] IO stalled. submitted {} -> {} completed {} -> {}",
-            dispatchers[i]->getName(), lastStat.numSubmitted, stat.numSubmitted,
-            lastStat.numCompleted, stat.numCompleted);
       healthy = false;
     }
     lastStats[i] = stat;
@@ -229,8 +223,6 @@ void NavyRequestScheduler::checkHealth(
   folly::fibers::forEach(funcs.begin(), funcs.end(), [](size_t, bool) {});
   if (!healthy) {
     numUnhealthy_++;
-    XLOG_N_PER_MS(ERR, 10, 600000) << folly::sformat(
-        "Navy job scheduler health check failed ({})", numUnhealthy_);
   }
 }
 

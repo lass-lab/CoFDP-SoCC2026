@@ -30,7 +30,7 @@ PercentileStats::Estimates PercentileStats::estimate() {
       folly::Range<const double*>{kQuantiles.begin(), kQuantiles.end()});
   XDCHECK_EQ(kQuantiles.size(), result.quantiles.size());
   if (result.count == 0) {
-    return {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    return {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0.0};
   }
   return {static_cast<uint64_t>(result.sum / result.count),
           static_cast<uint64_t>(result.quantiles[0].second),
@@ -46,7 +46,8 @@ PercentileStats::Estimates PercentileStats::estimate() {
           static_cast<uint64_t>(result.quantiles[10].second),
           static_cast<uint64_t>(result.quantiles[11].second),
           static_cast<uint64_t>(result.quantiles[12].second),
-          static_cast<uint64_t>(result.quantiles[13].second)};
+          static_cast<uint64_t>(result.quantiles[13].second),
+          0.0 /* stddev, not computed */};
 }
 
 void PercentileStats::visitQuantileEstimates(const CounterVisitor& visitor,
@@ -70,6 +71,7 @@ void PercentileStats::visitQuantileEstimates(const CounterVisitor& visitor,
   visitor(folly::sformat(fmt, prefix, "p999999"),
           static_cast<double>(rst.p999999));
   visitor(folly::sformat(fmt, prefix, "max"), static_cast<double>(rst.p100));
+  visitor(folly::sformat(fmt, prefix, "stddev"), rst.stddev);
 }
 } // namespace util
 } // namespace cachelib

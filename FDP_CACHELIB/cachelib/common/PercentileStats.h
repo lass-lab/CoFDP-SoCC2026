@@ -50,6 +50,9 @@ class PercentileStats {
     uint64_t p99999;
     uint64_t p999999;
     uint64_t p100;
+    // CoFDP: reported (as "<prefix>_stddev") but not computed: always 0.
+    // NOTE: see KNOWN_ISSUES (CL-15).
+    double stddev;
   };
 
   // visit each latency estimate using the visitor.
