@@ -4,7 +4,10 @@
 
 FSD="../femu-scripts"
 
-CPL=(pkgdep.sh femu-compile.sh run-whitebox.sh run-blackbox.sh run-nossd.sh run-zns.sh pin.sh ftk)
+# CoFDP: run-fdp.sh (FDP SSD, femu_mode=6) and run-ms.sh (multi-stream SSD,
+# femu_mode=7) are started from build-femu/ like the other run scripts and
+# write QEMU's output to ./log there
+CPL=(pkgdep.sh femu-compile.sh run-whitebox.sh run-blackbox.sh run-nossd.sh run-zns.sh run-fdp.sh run-ms.sh pin.sh ftk)
 
 echo ""
 echo "==> Copying following FEMU script to current directory:"

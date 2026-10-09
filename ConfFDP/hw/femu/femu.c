@@ -5,6 +5,15 @@
 
 #define NVME_SPEC_VER (0x00010400)
 
+/*
+ * CoFDP: every LBA format uses 4 KiB data and no metadata. The FDP and MS
+ * FTLs map one LBA to one NAND page (LBA == LPN), which holds with
+ * nand_page_size_kb=4 as set by run-fdp.sh and run-ms.sh; other page sizes
+ * are not supported, see KNOWN_ISSUES (FEMU-11). NOTE: the LBA format applies
+ * to every femu_mode; see KNOWN_ISSUES (FEMU-19).
+ */
+#define FEMU_LBADS    (12)
+
 static void nvme_clear_ctrl(FemuCtrl *n, bool shutdown)
 {
     int i;
@@ -336,15 +345,19 @@ static void nvme_ns_init_identify(FemuCtrl *n, NvmeIdNs *id_ns)
     id_ns->dpc           = n->dpc;
     id_ns->dps           = n->dps;
     id_ns->dlfeat        = 0x9;
-    id_ns->lbaf[0].lbads = 9;
+    id_ns->lbaf[0].lbads = FEMU_LBADS;
     id_ns->lbaf[0].ms    = 0;
 
-    npdg = 1;
+    /*
+     * Preferred write granularity/alignment: one NAND page. NOTE: divides by
+     * secsz rather than the LBA size; see KNOWN_ISSUES (FEMU-18).
+     */
+    npdg = (n->bb_params.nand_page_size_kb << 10) / n->bb_params.secsz;
     id_ns->npda = id_ns->npdg = npdg - 1;
 
     for (i = 0; i < n->nlbaf; i++) {
-        id_ns->lbaf[i].lbads = BDRV_SECTOR_BITS + i;
-        id_ns->lbaf[i].ms    = cpu_to_le16(n->meta);
+        id_ns->lbaf[i].lbads = FEMU_LBADS;
+        id_ns->lbaf[i].ms    = 0;
     }
 }
 
@@ -373,13 +386,15 @@ static int nvme_init_namespaces(FemuCtrl *n, Error **errp)
 {
     int i;
 
-    /* FIXME: FEMU only supports 1 namesapce now */
-    assert(n->num_namespaces == 1);
-
     for (i = 0; i < n->num_namespaces; i++) {
         NvmeNamespace *ns = &n->namespaces[i];
         ns->size = n->ns_size;
-        ns->start_block = i * n->ns_size >> BDRV_SECTOR_BITS;
+        /*
+         * Namespaces are consecutive slices of the backend. start_block is in
+         * LBAs; nvme_rw() adds it to the namespace-local SLBA, so the FTLs
+         * see device-global LBAs.
+         */
+        ns->start_block = i * n->ns_size >> FEMU_LBADS;
         ns->id = i + 1;
 
         if (nvme_init_namespace(n, ns, errp)) {
@@ -429,6 +444,10 @@ static void nvme_init_ctrl(FemuCtrl *n)
     id->psd[0].mp    = cpu_to_le16(0x9c4);
     id->psd[0].enlat = cpu_to_le32(0x10);
     id->psd[0].exlat = cpu_to_le32(0x4);
+    if (FDPSSD(n) || MSSSD(n)) {
+        /* Flexible Data Placement supported */
+        id->ctratt  |= cpu_to_le32(NVME_CTRATT_FDPS);
+    }
 
     n->features.arbitration     = 0x1f0f0706;
     n->features.power_mgmt      = 0;
@@ -523,6 +542,10 @@ static int nvme_register_extensions(FemuCtrl *n)
         nvme_register_bbssd(n);
     } else if (ZNSSD(n)) {
         nvme_register_znssd(n);
+    } else if (FDPSSD(n)) {
+        nvme_register_fdpssd(n);
+    } else if (MSSSD(n)) {
+        nvme_register_msssd(n);
     } else {
         /* TODO: For future extensions */
     }
@@ -653,6 +676,9 @@ static Property femu_props[] = {
     DEFINE_PROP_UINT16("vid", FemuCtrl, vid, 0x1d1d),
     DEFINE_PROP_UINT16("did", FemuCtrl, did, 0x1f1f),
     DEFINE_PROP_UINT8("femu_mode", FemuCtrl, femu_mode, FEMU_NOSSD_MODE),
+    DEFINE_PROP_UINT8("stream_number", FemuCtrl, stream_number, 4),
+    DEFINE_PROP_UINT8("rg_number", FemuCtrl, rg_number, 8),
+    DEFINE_PROP_UINT8("handle_number", FemuCtrl, handle_number, 4),
     DEFINE_PROP_UINT8("flash_type", FemuCtrl, flash_type, MLC),
     DEFINE_PROP_UINT8("lver", FemuCtrl, lver, 0x2),
     DEFINE_PROP_UINT16("lsec_size", FemuCtrl, oc_params.sec_size, 4096),
@@ -672,6 +698,8 @@ static Property femu_props[] = {
     DEFINE_PROP_INT32("secs_per_pg", FemuCtrl, bb_params.secs_per_pg, 8),
     DEFINE_PROP_INT32("pgs_per_blk", FemuCtrl, bb_params.pgs_per_blk, 256),
     DEFINE_PROP_INT32("blks_per_pl", FemuCtrl, bb_params.blks_per_pl, 256),
+    DEFINE_PROP_INT32("nand_page_size_kb", FemuCtrl, bb_params.nand_page_size_kb, 16),
+    DEFINE_PROP_INT32("nand_block_size_mb", FemuCtrl, bb_params.nand_block_size_mb, 4),
     DEFINE_PROP_INT32("pls_per_lun", FemuCtrl, bb_params.pls_per_lun, 1),
     DEFINE_PROP_INT32("luns_per_ch", FemuCtrl, bb_params.luns_per_ch, 8),
     DEFINE_PROP_INT32("nchs", FemuCtrl, bb_params.nchs, 8),

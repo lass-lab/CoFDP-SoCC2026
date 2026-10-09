@@ -296,6 +296,77 @@ Stay tuned.
 
 Stay tuned.
 
+### 7. Run FEMU as a configurable FDP SSD (``FDPSSD`` mode, CoFDP) ###
+
+```Bash
+./run-fdp.sh
+```
+
+``femu_mode=6`` (``hw/femu/fdp/``) emulates an NVMe Flexible Data Placement
+(FDP) SSD with ``rg_number`` reclaim groups (RGs) and ``handle_number``
+placement handles per RG. An RG is a set of dies, a reclaim unit (RU) is one
+block on every die of an RG, and every RG runs its own garbage collection.
+PIDs are flat: a write whose DSPEC carries PID ``p`` goes to RG
+``p / handle_number`` through placement handle ``p % handle_number``, and the
+Reclaim Unit Handle Status (I/O Management Receive) reports PIDs ``0`` to
+``rg_number * handle_number - 1``.
+
+The defaults of ``run-fdp.sh`` are: 64 GiB, 8 channels
+x 8 dies, 4 KiB pages, 16 MiB blocks, 4 RGs x 2 placement handles (8 PIDs),
+40/200 us page read/program, 2 ms erase and 25 us channel transfer, with an
+8-vCPU/16 GiB guest. Every setting can be overridden from the environment, e.g.
+``rg_number=1 handle_number=8 ./run-fdp.sh``.
+
+The FEMU reset, an I/O Management Send with management operation ``0x2`` (a
+FEMU extension, sent by ``tools/fdp-reset`` of the CoFDP repository), prints a
+dump of the RUs and of the counters accumulated since the previous reset, then
+resets the emulated SSD to empty. QEMU's output, including these dumps and a
+time-stamped ``GC-ing line:`` entry for every garbage collection, is saved to
+``./log`` in the directory the script is started from (``build-femu/log``).
+A dump looks like this:
+
+```
+msssd_io_mgmt_send_sungjin
+print_sungjin(spp->blks_per_line) : {<blocks per RU>}
+print_sungjin(spp->pgs_per_line) : {<pages per RU>}
+RG <r>-----------------------------          for every RG r,
+[<i>] stream id=<h> ipc=<n> vpc=<n> pos=<n>  one line per RU i
+------------------------------------
+RG <r> channel <a>-<b> / lun <c>-<d>         one line per RG
+RG <r> STREAM <h> : written : <pages>        one line per PID
+print_sungjin(ssd->sungjin_stat.block_erased) : {<blocks>}
+print_sungjin(ssd->sungjin_stat.copied) : {<pages>}
+print_sungjin(ssd->sungjin_stat.discard) : {<pages>}
+print_sungjin(ssd->sungjin_stat.discard_ignored) : {<pages>}
+print_sungjin(ssd->sungjin_stat.invalidated) : {<pages>}
+print_sungjin(sum_written) : {0}
+print_sungjin(ssd->sungjin_stat.write_io_n) : {<commands>}
+print_sungjin(ssd->sungjin_stat.read_io_n) : {<commands>}
+print_sungjin(ssd->sungjin_stat.read_sum) : {<pages>}
+INITIALIZED current time: <date>
+```
+
+An RU line shows the RU as it was before the reset: the placement handle that
+wrote it (``-1``: free), its invalid and valid pages, and its position in the
+garbage-collection victim queue of the RG (``0``: not queued).
+``RG r STREAM h : written`` is the number of 4 KiB pages the host wrote with PID
+``r * handle_number + h`` and ``copied`` the number of pages copied by garbage
+collection, so the write amplification factor is
+``1 + copied / (sum of all written)``. The ``sum_written`` line is always 0
+(``FEMU-8``), and the ``STREAM`` lines that FEMU prints when it starts are not
+part of a dump. Known defects of the emulator are listed in ``KNOWN_ISSUES.md``
+of the CoFDP repository (``FEMU-*``).
+
+### 8. Run FEMU as a multi-streamed SSD (``MSSSD`` mode) ###
+
+```Bash
+./run-ms.sh
+```
+
+``femu_mode=7`` (``hw/femu/mstream/``) emulates a multi-streamed SSD: each
+namespace is one stream, which keeps its own open superblock. The FEMU reset
+prints the ``block_erased`` and ``copied`` counters and resets the SSD to empty.
+
 
 ### Contributing ###
 

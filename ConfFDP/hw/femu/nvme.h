@@ -302,12 +302,89 @@ typedef struct NvmeCmd {
     uint32_t    cdw11;
     uint32_t    cdw12;
     uint32_t    cdw13;
-    uint32_t    cdw14;
-    uint32_t    cdw15;
+    union {
+        /*
+         * Dataset Management in the FDP and MS modes: nvme_dsm() replaces
+         * CDW14/15 of the queued copy of the command with the host address
+         * of the range list it DMA'd; the FTL thread consumes and frees it.
+         */
+        uint64_t    dsm_ranges;
+        struct {
+            uint32_t    cdw14;
+            uint32_t    cdw15;
+        };
+    };
 } NvmeCmd;
 
 #define NVME_CMD_FLAGS_FUSE(flags) (flags & 0x3)
 #define NVME_CMD_FLAGS_PSDT(flags) ((flags >> 6) & 0x3)
+
+/* I/O Management Send (opcode 1Dh) management operations */
+enum NvmeIoms2Mo {
+    NVME_IOMS_MO_NOP        = 0x0,
+    NVME_IOMS_MO_RUH_UPDATE = 0x1,
+    /*
+     * FEMU vendor extension: reset the FTL of the FDP/MS models and print the
+     * write/GC counters accumulated since the previous reset (WAF input).
+     */
+    NVME_IOMS_MO_FEMU_RESET = 0x2,
+};
+
+/* I/O Management Receive (opcode 12h) management operations */
+enum NvmeIomr2Mo {
+    NVME_IOMR_MO_NOP        = 0x0,
+    NVME_IOMR_MO_RUH_STATUS = 0x1,
+};
+
+/* FDP Configurations log page (LID 20h) */
+typedef struct QEMU_PACKED NvmeFdpConfsHdr {
+    uint16_t num_confs;
+    uint8_t  version;
+    uint8_t  rsvd3;
+    uint32_t size;
+    uint8_t  rsvd8[8];
+} NvmeFdpConfsHdr;
+
+typedef struct QEMU_PACKED NvmeFdpDescrHdr {
+    uint16_t descr_size;
+    uint8_t  fdpa;
+    uint8_t  vss;
+    uint32_t nrg;
+    uint16_t nruh;
+    uint16_t maxpids;
+    uint32_t nnss;
+    uint64_t runs;
+    uint32_t erutl;
+    uint8_t  rsvd28[36];
+} NvmeFdpDescrHdr;
+
+typedef struct QEMU_PACKED NvmeRuhDescr {
+    uint8_t ruht;
+    uint8_t rsvd1[3];
+} NvmeRuhDescr;
+
+enum NvmeRuhType {
+    NVME_RUHT_INITIALLY_ISOLATED    = 1,
+    NVME_RUHT_PERSISTENTLY_ISOLATED = 2,
+};
+
+/* Reclaim Unit Handle Status (I/O Management Receive, MO 1) */
+typedef struct QEMU_PACKED NvmeRuhStatus {
+    uint8_t  rsvd0[14];
+    uint16_t nruhsd;
+} NvmeRuhStatus;
+
+typedef struct NvmeRuhStatusDescr {
+    uint16_t pid;
+    uint16_t ruhid;
+    uint32_t earutr;
+    uint64_t ruamw;
+    uint8_t  rsvd16[16];
+} NvmeRuhStatusDescr;
+
+enum NvmeIdCtrlCtratt {
+    NVME_CTRATT_FDPS = 1 << 19,
+};
 
 enum NvmeAdminCommands {
     NVME_ADM_CMD_DELETE_SQ      = 0x00,
@@ -338,6 +415,8 @@ enum NvmeIoCommands {
     NVME_CMD_COMPARE            = 0x05,
     NVME_CMD_WRITE_ZEROES       = 0x08,
     NVME_CMD_DSM                = 0x09,
+    NVME_CMD_IO_MGMT_RECV       = 0x12,
+    NVME_CMD_IO_MGMT_SEND       = 0x1d,
     NVME_CMD_ZONE_MGMT_SEND     = 0x79,
     NVME_CMD_ZONE_MGMT_RECV     = 0x7a,
     NVME_CMD_ZONE_APPEND        = 0x7d,
@@ -425,7 +504,10 @@ typedef struct NvmeRwCmd {
     uint64_t    slba;
     uint16_t    nlb;
     uint16_t    control;
-    uint32_t    dsmgmt;
+    /* CDW13 */
+    uint8_t     dsmgmt;
+    uint8_t     rsvd;
+    uint16_t    dspec;      /* directive specific: the FDP placement ID */
     uint32_t    reftag;
     uint16_t    apptag;
     uint16_t    appmask;
@@ -653,6 +735,10 @@ enum LogIdentifier {
     NVME_LOG_SMART_INFO     = 0x02,
     NVME_LOG_FW_SLOT_INFO   = 0x03,
     NVME_LOG_CMD_EFFECTS    = 0x05,
+    NVME_LOG_FDP_CONFS      = 0x20,
+    NVME_LOG_FDP_RUH_USAGE  = 0x21,
+    NVME_LOG_FDP_STATS      = 0x22,
+    NVME_LOG_FDP_EVENTS     = 0x23,
 };
 
 typedef struct NvmePSD {
@@ -821,6 +907,8 @@ enum NvmeFeatureIds {
     NVME_WRITE_ATOMICITY            = 0xa,
     NVME_ASYNCHRONOUS_EVENT_CONF    = 0xb,
     NVME_TIMESTAMP                  = 0xe,
+    NVME_FDP_MODE                   = 0x1d,
+    NVME_FDP_EVENTS                 = 0x1e,
     NVME_SOFTWARE_PROGRESS_MARKER   = 0x80,
     NVME_FID_MAX                    = 0x100
 };
@@ -950,6 +1038,12 @@ static inline void nvme_check_size(void)
     QEMU_BUILD_BUG_ON(sizeof(NvmeSmartLog) != 512);
     QEMU_BUILD_BUG_ON(sizeof(NvmeIdCtrl) != 4096);
     QEMU_BUILD_BUG_ON(sizeof(NvmeIdNs) != 4096);
+    QEMU_BUILD_BUG_ON(offsetof(NvmeRwCmd, dspec) != 54);
+    QEMU_BUILD_BUG_ON(sizeof(NvmeFdpConfsHdr) != 16);
+    QEMU_BUILD_BUG_ON(sizeof(NvmeFdpDescrHdr) != 64);
+    QEMU_BUILD_BUG_ON(sizeof(NvmeRuhDescr) != 4);
+    QEMU_BUILD_BUG_ON(sizeof(NvmeRuhStatus) != 16);
+    QEMU_BUILD_BUG_ON(sizeof(NvmeRuhStatusDescr) != 32);
 
     /* Coperd: FIXME, check FEMU OC structure size */
     //oc12_check_size();
@@ -1163,6 +1257,10 @@ typedef struct BbCtrlParams {
 
     int gc_thres_pcent;
     int gc_thres_pcent_high;
+
+    /* NAND geometry of the FDP and MS models */
+    int nand_page_size_kb;
+    int nand_block_size_mb;
 } BbCtrlParams;
 
 typedef struct ZNSCtrlParams {
@@ -1313,6 +1411,9 @@ typedef struct FemuCtrl {
     uint64_t        eis_addr_hva;
 
     uint8_t         femu_mode;
+    uint8_t         stream_number;  /* MS mode: # of streams */
+    uint8_t         rg_number;      /* FDP mode: # of reclaim groups */
+    uint8_t         handle_number;  /* FDP mode: # of placement handles per RG */
     uint8_t         lver; /* Coperd: OCSSD version, 0x1 -> OC1.2, 0x2 -> OC2.0 */
     uint32_t        memsz;
     OcCtrlParams    oc_params;
@@ -1383,6 +1484,8 @@ enum {
     FEMU_ZNSSD_MODE = 3,
     FEMU_SMARTSSD_MODE,
     FEMU_KVSSD_MODE,
+    FEMU_FDP_MODE = 6,      /* configurable FDP SSD (CoFDP) */
+    FEMU_MSSSD_MODE = 7,    /* multi-streamed SSD, stream = NSID - 1 */
 };
 
 enum {
@@ -1413,6 +1516,27 @@ static inline bool NOSSD(FemuCtrl *n)
 static inline bool ZNSSD(FemuCtrl *n)
 {
     return (n->femu_mode == FEMU_ZNSSD_MODE);
+}
+
+static inline bool FDPSSD(FemuCtrl *n)
+{
+    return (n->femu_mode == FEMU_FDP_MODE);
+}
+
+static inline bool MSSSD(FemuCtrl *n)
+{
+    return (n->femu_mode == FEMU_MSSSD_MODE);
+}
+
+/*
+ * True if [slba, slba + nlb) does not fit in a namespace of nsze blocks.
+ * Same result as "slba + nlb > nsze", but immune to 64-bit wrap-around of
+ * the guest-controlled values.
+ */
+static inline bool nvme_lba_range_invalid(uint64_t slba, uint64_t nlb,
+                                          uint64_t nsze)
+{
+    return nlb > nsze || slba > nsze - nlb;
 }
 
 /* Basic NVMe Queue Pair operation APIs from nvme-util.c */
@@ -1474,6 +1598,8 @@ int nvme_register_ocssd20(FemuCtrl *n);
 int nvme_register_nossd(FemuCtrl *n);
 int nvme_register_bbssd(FemuCtrl *n);
 int nvme_register_znssd(FemuCtrl *n);
+int nvme_register_fdpssd(FemuCtrl *n);
+int nvme_register_msssd(FemuCtrl *n);
 
 static inline uint64_t ns_blks(NvmeNamespace *ns, uint8_t lba_idx)
 {

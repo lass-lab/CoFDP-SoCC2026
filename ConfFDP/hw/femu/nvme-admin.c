@@ -51,6 +51,8 @@ static const uint32_t nvme_cse_iocs_nvm[256] = {
     [NVME_CMD_READ]                 = NVME_CMD_EFF_CSUPP,
     [NVME_CMD_DSM]                  = NVME_CMD_EFF_CSUPP | NVME_CMD_EFF_LBCC,
     [NVME_CMD_COMPARE]              = NVME_CMD_EFF_CSUPP,
+    [NVME_CMD_IO_MGMT_SEND]         = NVME_CMD_EFF_CSUPP | NVME_CMD_EFF_LBCC,
+    [NVME_CMD_IO_MGMT_RECV]         = NVME_CMD_EFF_CSUPP,
 };
 
 static const uint32_t nvme_cse_iocs_zoned[256] = {
@@ -678,6 +680,16 @@ static uint16_t nvme_get_feature(FemuCtrl *n, NvmeCmd *cmd, NvmeCqe *cqe)
     case NVME_SOFTWARE_PROGRESS_MARKER:
         cqe->n.result = cpu_to_le32(n->features.sw_prog_marker);
         break;
+    case NVME_FDP_MODE:
+    case NVME_FDP_EVENTS:
+        /*
+         * Not emulated: the FDP-capable modes succeed with a zero result
+         * (i.e. FDPE reads as 0 although CTRATT.FDPS is set).
+         */
+        if (FDPSSD(n) || MSSSD(n)) {
+            return NVME_SUCCESS;
+        }
+        return NVME_INVALID_FIELD | NVME_DNR;
     default:
         return NVME_INVALID_FIELD | NVME_DNR;
     }
@@ -748,6 +760,13 @@ static uint16_t nvme_set_feature(FemuCtrl *n, NvmeCmd *cmd, NvmeCqe *cqe)
     case NVME_SOFTWARE_PROGRESS_MARKER:
         n->features.sw_prog_marker = dw11;
         break;
+    case NVME_FDP_MODE:
+    case NVME_FDP_EVENTS:
+        /* Not emulated: accepted and ignored in the FDP-capable modes */
+        if (FDPSSD(n) || MSSSD(n)) {
+            return NVME_SUCCESS;
+        }
+        return NVME_INVALID_FIELD | NVME_DNR;
     default:
         return NVME_INVALID_FIELD | NVME_DNR;
     }

@@ -113,8 +113,11 @@ uint16_t femu_nvme_rw_check_req(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
                                 uint32_t nlb, uint16_t ctrl, uint64_t data_size,
                                 uint64_t meta_size)
 {
+    /* slba and elba are device-global (see nvme_rw()) */
+    uint64_t ns_slba = slba - ns->start_block;
+    uint64_t ns_elba = elba - ns->start_block;
 
-    if (elba > le64_to_cpu(ns->id_ns.nsze)) {
+    if (nvme_lba_range_invalid(ns_slba, nlb, le64_to_cpu(ns->id_ns.nsze))) {
         nvme_set_error_page(n, req->sq->sqid, cmd->cid, NVME_LBA_RANGE,
                             offsetof(NvmeRwCmd, nlb), elba, ns->id);
         return NVME_LBA_RANGE | NVME_DNR;
@@ -132,13 +135,15 @@ uint16_t femu_nvme_rw_check_req(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
     if ((ctrl & NVME_RW_PRINFO_PRACT) && !(ns->id_ns.dps & DPS_TYPE_MASK)) {
         nvme_set_error_page(n, req->sq->sqid, cmd->cid, NVME_INVALID_FIELD,
                             offsetof(NvmeRwCmd, control), ctrl, ns->id);
-        /* Not contemplated in LightNVM for now */
-        if (OCSSD(n)) {
-            return 0;
-        }
-        return NVME_INVALID_FIELD | NVME_DNR;
+        /*
+         * Upstream FEMU accepts PRACT without protection information only in
+         * OCSSD mode (not contemplated in LightNVM); this fork accepts it in
+         * every mode. NOTE: see KNOWN_ISSUES (FEMU-L5).
+         */
+        return 0;
     }
-    if (!req->is_write && find_next_bit(ns->uncorrectable, elba, slba) < elba) {
+    if (!req->is_write &&
+        find_next_bit(ns->uncorrectable, ns_elba, ns_slba) < ns_elba) {
         nvme_set_error_page(n, req->sq->sqid, cmd->cid, NVME_UNRECOVERED_READ,
                             offsetof(NvmeRwCmd, slba), elba, ns->id);
         return NVME_UNRECOVERED_READ;

@@ -84,7 +84,7 @@ static void nvme_process_sq_io(void *opaque, int index_poller)
             /* Normal I/Os that don't need delay emulation */
             req->status = status;
         } else {
-            femu_err("Error IO processed!\n");
+            femu_err("Error IO processed! %d\n", req->cmd_opcode);
         }
 
         processed++;
@@ -132,7 +132,7 @@ static void nvme_process_cq_cpl(void *arg, int index_poller)
     int rc;
     int i;
 
-    if (BBSSD(n) || ZNSSD(n)) {
+    if (BBSSD(n) || ZNSSD(n) || FDPSSD(n) || MSSSD(n)) {
         rp = n->to_poller[index_poller];
     }
 
@@ -239,7 +239,8 @@ uint16_t nvme_rw(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd, NvmeRequest *req)
     NvmeRwCmd *rw = (NvmeRwCmd *)cmd;
     uint16_t ctrl = le16_to_cpu(rw->control);
     uint32_t nlb  = le16_to_cpu(rw->nlb) + 1;
-    uint64_t slba = le64_to_cpu(rw->slba);
+    /* Device-global LBA: namespaces are consecutive slices of the backend */
+    uint64_t slba = le64_to_cpu(rw->slba) + ns->start_block;
     uint64_t prp1 = le64_to_cpu(rw->prp1);
     uint64_t prp2 = le64_to_cpu(rw->prp2);
     const uint8_t lba_index = NVME_ID_NS_FLBAS_INDEX(ns->id_ns.flbas);
@@ -269,7 +270,11 @@ uint16_t nvme_rw(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd, NvmeRequest *req)
 
     req->slba = slba;
     req->status = NVME_SUCCESS;
-    req->nlb = nlb;
+    /*
+     * CoFDP: 0-based, as encoded in the command; the FDP and MS FTLs process
+     * LPNs slba..slba + nlb inclusive. NOTE: see KNOWN_ISSUES (FEMU-16).
+     */
+    req->nlb = nlb - 1;
 
     ret = backend_rw(n->mbe, &req->qsg, &data_offset, req->is_write);
     if (!ret) {
@@ -277,6 +282,25 @@ uint16_t nvme_rw(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd, NvmeRequest *req)
     }
 
     return NVME_DNR;
+}
+
+/*
+ * I/O Management Send. The FTL thread of the FDP/MS models executes the
+ * accepted operations (RUH Update is a no-op there); every mode accepts them.
+ * NOTE: see KNOWN_ISSUES (FEMU-17).
+ */
+static uint16_t nvme_io_mgmt_send(NvmeCmd *cmd)
+{
+    uint8_t mo = le32_to_cpu(cmd->cdw10) & 0xff;
+
+    switch (mo) {
+    case NVME_IOMS_MO_NOP:
+    case NVME_IOMS_MO_RUH_UPDATE:
+    case NVME_IOMS_MO_FEMU_RESET:
+        return NVME_SUCCESS;
+    default:
+        return NVME_INVALID_FIELD | NVME_DNR;
+    }
 }
 
 static uint16_t nvme_dsm(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
@@ -295,7 +319,8 @@ static uint16_t nvme_dsm(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
         uint32_t nlb;
         NvmeDsmRange *range = g_malloc0(sizeof(NvmeDsmRange) * nr);
 
-        if (dma_write_prp(n, (uint8_t *)range, sizeof(range), prp1, prp2)) {
+        if (dma_write_prp(n, (uint8_t *)range, sizeof(NvmeDsmRange) * nr,
+                          prp1, prp2)) {
             nvme_set_error_page(n, req->sq->sqid, cmd->cid, NVME_INVALID_FIELD,
                                 offsetof(NvmeCmd, dptr.prp1), 0, ns->id);
             g_free(range);
@@ -306,7 +331,7 @@ static uint16_t nvme_dsm(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
         for (i = 0; i < nr; i++) {
             slba = le64_to_cpu(range[i].slba);
             nlb = le32_to_cpu(range[i].nlb);
-            if (slba + nlb > le64_to_cpu(ns->id_ns.nsze)) {
+            if (nvme_lba_range_invalid(slba, nlb, le64_to_cpu(ns->id_ns.nsze))) {
                 nvme_set_error_page(n, req->sq->sqid, cmd->cid, NVME_LBA_RANGE,
                                     offsetof(NvmeCmd, cdw10), slba + nlb, ns->id);
                 g_free(range);
@@ -315,7 +340,17 @@ static uint16_t nvme_dsm(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
 
             bitmap_clear(ns->util, slba, nlb);
         }
-        g_free(range);
+
+        if (FDPSSD(n) || MSSSD(n)) {
+            /*
+             * Hand the namespace-relative ranges to the FTL thread, which
+             * deallocates them and frees the list.
+             * NOTE: see KNOWN_ISSUES (FEMU-6).
+             */
+            req->cmd.dsm_ranges = (uintptr_t)range;
+        } else {
+            g_free(range);
+        }
     }
     return NVME_SUCCESS;
 }
@@ -440,6 +475,11 @@ static uint16_t nvme_io_cmd(FemuCtrl *n, NvmeCmd *cmd, NvmeRequest *req)
             return nvme_dsm(n, ns, cmd, req);
         }
         return NVME_INVALID_OPCODE | NVME_DNR;
+    case NVME_CMD_IO_MGMT_SEND:
+        return nvme_io_mgmt_send(cmd);
+    case NVME_CMD_IO_MGMT_RECV:
+        /* The FTL thread builds the reply (e.g. RUH Status) */
+        return NVME_SUCCESS;
     case NVME_CMD_COMPARE:
         if (NVME_ONCS_COMPARE & n->oncs) {
             return nvme_compare(n, ns, cmd, req);
