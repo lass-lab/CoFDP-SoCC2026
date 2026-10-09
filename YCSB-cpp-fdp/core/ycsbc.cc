@@ -162,7 +162,10 @@ int main(const int argc, const char *argv[]) {
   }
 
   measurements->Reset();
-  std::this_thread::sleep_for(std::chrono::seconds(stoi(props.GetProperty("sleepafterload", "0"))));
+  // NOTE: always pauses 720 s between the load and run phases, even when only
+  // one of them is requested (-load or -run alone); the upstream sleepafterload
+  // property is ignored. See KNOWN_ISSUES (YCSB-3).
+  std::this_thread::sleep_for(std::chrono::seconds(720));
 
 
   // transaction phase

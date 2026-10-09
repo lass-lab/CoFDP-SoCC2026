@@ -36,8 +36,13 @@ class ScrambledZipfianGenerator : public Generator<uint64_t> {
   uint64_t Last();
 
  private:
-  static constexpr double kUsedZipfianConstant = 0.99;
-  static constexpr double kZetan = 26.46902820178302;
+  // Precomputed Zeta(kItemCount + 1, theta) for the default theta (see
+  // ZipfianGenerator::kZipfianConst), which avoids summing 1e10 terms at
+  // startup. 90.5 approximates the exact value 90.5699; changing it changes
+  // every generated key stream. Any other zipfian_const, including the YCSB
+  // default 0.99, computes the sum at startup. See KNOWN_ISSUES (YCSB-8).
+  static constexpr double kUsedZipfianConstant = 0.90;
+  static constexpr double kZetan = 90.5;
   static constexpr uint64_t kItemCount = 10000000000LL;
   const uint64_t base_;
   const uint64_t num_items_;

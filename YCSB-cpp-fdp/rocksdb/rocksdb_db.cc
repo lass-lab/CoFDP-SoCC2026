@@ -365,6 +365,11 @@ void RocksdbDB::GetOptions(const utils::Properties &props, rocksdb::Options *opt
       opt->OptimizeLevelStyleCompaction();
     }
   }
+  // LoadOptionsFromFile() replaces all DBOptions with the parsed ones, whose
+  // env is Env::Default(). Re-apply the env built from rocksdb.env_uri /
+  // rocksdb.fs_uri so that an options file does not silently drop it (e.g. the
+  // TorFS file system of the UserFDP runs).
+  opt->env = env;
 }
 
 void RocksdbDB::SerializeRow(const std::vector<Field> &values, std::string &data) {

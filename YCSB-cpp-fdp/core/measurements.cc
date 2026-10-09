@@ -8,6 +8,10 @@
 #include "measurements.h"
 #include "utils/utils.h"
 
+#include <cerrno>
+#include <cstdio>
+#include <cstring>
+#include <iostream>
 #include <limits>
 #include <numeric>
 #include <sstream>
@@ -18,6 +22,13 @@ namespace {
   const std::string MEASUREMENT_TYPE_DEFAULT = "hdrhistogram";
 #else
   const std::string MEASUREMENT_TYPE_DEFAULT = "basic";
+#endif
+
+#ifdef HDRMEASUREMENT
+  // Directory that receives the per-operation latency CSVs (ycsbhist<OP>) at
+  // every status report; an empty value disables them.
+  const std::string HDRHISTOGRAM_CSV_DIR = "hdrhistogram.csv_dir";
+  const std::string HDRHISTOGRAM_CSV_DIR_DEFAULT = "/home/femu/isol";
 #endif
 } // anonymous
 
@@ -70,7 +81,8 @@ void BasicMeasurements::Reset() {
 }
 
 #ifdef HDRMEASUREMENT
-HdrHistogramMeasurements::HdrHistogramMeasurements() {
+HdrHistogramMeasurements::HdrHistogramMeasurements(const std::string &csv_dir)
+    : csv_dir_(csv_dir), csv_error_reported_(false) {
   for (int op = 0; op < MAXOPTYPE; op++) {
     if (hdr_init(10, 100LL * 1000 * 1000 * 1000, 3, &histogram_[op]) != 0) {
       utils::Exception("hdr init failed");
@@ -92,6 +104,8 @@ std::string HdrHistogramMeasurements::GetStatusMsg() {
     uint64_t cnt = histogram_[op]->total_count;
     if (cnt == 0)
       continue;
+    // NOTE: stdev is printed in ns while the other latencies are in us;
+    // see KNOWN_ISSUES (YCSB-7).
     msg_stream << " [" << kOperationString[op] << ":"
                << " Count=" << cnt
                << " Max=" << hdr_max(histogram_[op]) / 1000.0
@@ -101,10 +115,34 @@ std::string HdrHistogramMeasurements::GetStatusMsg() {
                << " 99=" << hdr_value_at_percentile(histogram_[op], 99) / 1000.0
                << " 99.9=" << hdr_value_at_percentile(histogram_[op], 99.9) / 1000.0
                << " 99.99=" << hdr_value_at_percentile(histogram_[op], 99.99) / 1000.0
+               << " stdev=" << hdr_stddev(histogram_[op])
                << "]";
     total_cnt += cnt;
+    WritePercentileCsv(op);
   }
   return std::to_string(total_cnt) + msg_stream.str();
+}
+
+// Rewrites <csv_dir>/ycsbhist<OP> (e.g. ycsbhistREAD) with the latency
+// distribution of @op recorded so far, in HdrHistogram's percentile CSV format
+// with values in ns. If the file cannot be created, the dump is skipped and
+// the failure is reported once.
+void HdrHistogramMeasurements::WritePercentileCsv(Operation op) {
+  if (csv_dir_.empty()) {
+    return;
+  }
+  const std::string path = csv_dir_ + "/ycsbhist" + kOperationString[op];
+  FILE *csv = fopen(path.c_str(), "w");
+  if (csv == nullptr) {
+    if (!csv_error_reported_.exchange(true)) {
+      std::cerr << "Cannot write " << path << ": " << strerror(errno)
+                << "; skipping the latency CSVs (set " << HDRHISTOGRAM_CSV_DIR << ")"
+                << std::endl;
+    }
+    return;
+  }
+  hdr_percentiles_print(histogram_[op], csv, 5, 1.0, CSV);
+  fclose(csv);
 }
 
 void HdrHistogramMeasurements::Reset() {
@@ -122,7 +160,8 @@ Measurements *CreateMeasurements(utils::Properties *props) {
     measurements = new BasicMeasurements();
 #ifdef HDRMEASUREMENT
   } else if (name == "hdrhistogram") {
-    measurements = new HdrHistogramMeasurements();
+    measurements = new HdrHistogramMeasurements(
+        props->GetProperty(HDRHISTOGRAM_CSV_DIR, HDRHISTOGRAM_CSV_DIR_DEFAULT));
 #endif
   } else {
     measurements = nullptr;

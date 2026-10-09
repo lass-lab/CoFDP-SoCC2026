@@ -1,0 +1,23 @@
+# Yahoo! Cloud System Benchmark
+# CoFDP write-only workload "uniform": run with -load only.
+#   loadkeydistribution=requestdistribution draws every load key from the
+#   request distribution: the recordcount inserts overwrite keys instead of
+#   creating recordcount distinct records (core/core_workload.h, KNOWN_ISSUES
+#   YCSB-4). The proportions below only apply to a run phase.
+#   Default data size: 1 KB records (10 fields, 100 bytes each, plus key)
+#   Request distribution: uniform
+
+recordcount=73400320
+operationcount=52428800
+workload=com.yahoo.ycsb.workloads.CoreWorkload
+
+readallfields=true
+
+readproportion=0.5
+updateproportion=0.5
+scanproportion=0
+insertproportion=0
+
+requestdistribution=uniform
+loadkeydistribution=requestdistribution
+

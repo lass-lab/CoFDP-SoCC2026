@@ -92,6 +92,9 @@ const string CoreWorkload::INSERT_ORDER_DEFAULT = "hashed";
 const string CoreWorkload::INSERT_START_PROPERTY = "insertstart";
 const string CoreWorkload::INSERT_START_DEFAULT = "0";
 
+const string CoreWorkload::LOAD_KEY_DISTRIBUTION_PROPERTY = "loadkeydistribution";
+const string CoreWorkload::LOAD_KEY_DISTRIBUTION_DEFAULT = "sequential";
+
 const string CoreWorkload::RECORD_COUNT_PROPERTY = "recordcount";
 const string CoreWorkload::OPERATION_COUNT_PROPERTY = "operationcount";
 
@@ -140,6 +143,16 @@ void CoreWorkload::Init(const utils::Properties &p) {
     ordered_inserts_ = false;
   } else {
     ordered_inserts_ = true;
+  }
+
+  std::string load_key_dist = p.GetProperty(LOAD_KEY_DISTRIBUTION_PROPERTY,
+                                            LOAD_KEY_DISTRIBUTION_DEFAULT);
+  if (load_key_dist == "sequential") {
+    load_keys_from_request_dist_ = false;
+  } else if (load_key_dist == "requestdistribution") {
+    load_keys_from_request_dist_ = true;
+  } else {
+    throw utils::Exception("Unknown load key distribution: " + load_key_dist);
   }
 
 
@@ -257,7 +270,14 @@ std::string CoreWorkload::NextFieldName() {
 }
 
 bool CoreWorkload::DoInsert(DB &db) {
-  const std::string key = BuildKeyName(insert_key_sequence_->Next());
+  // NOTE: the write-only specs (workloads/workload_{zipfian,uniform,latest})
+  // set loadkeydistribution=requestdistribution: each load-phase insert then
+  // writes a key drawn from the request distribution, like a read or update,
+  // so the load phase overwrites keys instead of inserting recordcount
+  // distinct records; see KNOWN_ISSUES (YCSB-4).
+  const uint64_t key_num = load_keys_from_request_dist_ ? NextTransactionKeyNum()
+                                                       : insert_key_sequence_->Next();
+  const std::string key = BuildKeyName(key_num);
   std::vector<DB::Field> fields;
   BuildValues(fields);
   return db.Insert(table_name_, key, fields) == DB::kOK;

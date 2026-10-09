@@ -154,6 +154,16 @@ class CoreWorkload {
   static const std::string INSERT_START_PROPERTY;
   static const std::string INSERT_START_DEFAULT;
 
+  ///
+  /// The name of the property for the keys written by the load phase.
+  /// Options are "sequential" (YCSB's load: the next key of the insert
+  /// sequence, so every record is inserted once) and "requestdistribution"
+  /// (a key drawn from the request distribution, as for a read or update, so
+  /// keys repeat and the load phase becomes a write-only overwrite stream).
+  ///
+  static const std::string LOAD_KEY_DISTRIBUTION_PROPERTY;
+  static const std::string LOAD_KEY_DISTRIBUTION_DEFAULT;
+
   static const std::string RECORD_COUNT_PROPERTY;
   static const std::string OPERATION_COUNT_PROPERTY;
 
@@ -184,7 +194,8 @@ class CoreWorkload {
       field_count_(0), read_all_fields_(false), write_all_fields_(false),
       field_len_generator_(nullptr), key_chooser_(nullptr), field_chooser_(nullptr),
       scan_len_chooser_(nullptr), insert_key_sequence_(nullptr),
-      transaction_insert_key_sequence_(nullptr), ordered_inserts_(true), record_count_(0) {
+      transaction_insert_key_sequence_(nullptr), ordered_inserts_(true),
+      load_keys_from_request_dist_(false), record_count_(0) {
   }
 
   virtual ~CoreWorkload() {
@@ -224,6 +235,7 @@ class CoreWorkload {
   CounterGenerator *insert_key_sequence_; // load insert key gen
   AcknowledgedCounterGenerator *transaction_insert_key_sequence_; // transaction insert key gen
   bool ordered_inserts_;
+  bool load_keys_from_request_dist_; // loadkeydistribution=requestdistribution
   size_t record_count_;
   int zero_padding_;
 };

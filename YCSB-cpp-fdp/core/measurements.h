@@ -44,12 +44,16 @@ class BasicMeasurements : public Measurements {
 #ifdef HDRMEASUREMENT
 class HdrHistogramMeasurements : public Measurements {
  public:
-  HdrHistogramMeasurements();
+  explicit HdrHistogramMeasurements(const std::string &csv_dir);
   void Report(Operation op, uint64_t latency) override;
   std::string GetStatusMsg() override;
   void Reset() override;
  private:
+  void WritePercentileCsv(Operation op);
+
   hdr_histogram *histogram_[MAXOPTYPE];
+  const std::string csv_dir_;
+  std::atomic<bool> csv_error_reported_;
 };
 #endif
 

@@ -1,0 +1,34 @@
+# RocksDB tenant 0; build ycsb against the RocksDB F2FS fork (FDP_ROCKSDB_F2FS).
+# /home/femu/tenant0 is outside the F2FS mount: the run recipe creates it and
+# bind-mounts P-Directories into it (PiDir-Binding) before ycsb starts;
+# otherwise the DB silently lives on the root file system.
+# rocksdb.optionsfile is relative to YCSB-cpp-fdp/, the directory to run ycsb
+# from; -p rocksdb.dbname=... or -p rocksdb.optionsfile=... after -P overrides.
+rocksdb.dbname=/home/femu/tenant0
+rocksdb.format=single
+rocksdb.destroy=false
+
+# Load options from file
+rocksdb.optionsfile=rocksdb/rocksdb_f2fs_options.ini
+
+# Below options are ignored if options file is used
+rocksdb.compression=snappy
+rocksdb.max_background_jobs=2
+rocksdb.target_file_size_base=67108864
+rocksdb.target_file_size_multiplier=1
+rocksdb.max_bytes_for_level_base=268435456
+rocksdb.write_buffer_size=67108864
+rocksdb.max_open_files=-1
+rocksdb.max_write_buffer_number=2
+rocksdb.use_direct_io_for_flush_compaction=false
+rocksdb.use_direct_reads=false
+rocksdb.allow_mmap_writes=false
+rocksdb.allow_mmap_reads=false
+rocksdb.cache_size=8388608
+rocksdb.bloom_bits=0
+
+# deprecated since rocksdb 8.0
+rocksdb.compressed_cache_size=0
+
+rocksdb.increase_parallelism=false
+rocksdb.optimize_level_style_compaction=false

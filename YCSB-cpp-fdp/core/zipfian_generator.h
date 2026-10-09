@@ -21,7 +21,10 @@ namespace ycsbc {
 
 class ZipfianGenerator : public Generator<uint64_t> {
  public:
-  static constexpr double kZipfianConst = 0.99;
+  // Default theta. The CoFDP experiments use 0.90 instead of the YCSB default
+  // 0.99 for every zipfian request distribution and, through
+  // SkewedLatestGenerator, for every latest one.
+  static constexpr double kZipfianConst = 0.90;
   static constexpr uint64_t kMaxNumItems = (UINT64_MAX >> 24);
 
   ZipfianGenerator(uint64_t num_items) :
