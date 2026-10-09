@@ -33,6 +33,7 @@
 #include "db/range_del_aggregator.h"
 #include "db/version_edit.h"
 #include "db/version_set.h"
+#include "env/pdir_placement.h"
 #include "file/filename.h"
 #include "file/read_write_util.h"
 #include "file/sst_file_manager_impl.h"
@@ -732,9 +733,13 @@ Status CompactionJob::Run() {
     constexpr IODebugContext* dbg = nullptr;
 
     if (output_directory_) {
+      // CoFDP: sync the P-Directory of the output level instead of the DB
+      // directory (env/pdir_placement.h).
       io_s = output_directory_->FsyncWithDirOptions(
           IOOptions(), dbg,
-          DirFsyncOptions(DirFsyncOptions::FsyncReason::kNewFileSynced));
+          DirFsyncOptions(
+              DirFsyncOptions::FsyncReason::kNewFileSynced,
+              PDirClassForSstLevel(compact_->compaction->output_level())));
     }
 
     if (io_s.ok() && wrote_new_blob_files && blob_output_directory_ &&
@@ -1951,6 +1956,12 @@ Status CompactionJob::OpenCompactionOutputFile(SubcompactionState* sub_compact,
     temperature = last_level_temp;
   }
   fo_copy.temperature = temperature;
+
+  // CoFDP: the P-Directory placement shim places SSTs by creation level.
+  if (PDirPlacement* pdir = cfd->ioptions().fs->pdir_placement()) {
+    pdir->RecordSstCreationLevel(file_number,
+                                 sub_compact->compaction->output_level());
+  }
 
   Status s;
   IOStatus io_s = NewWritableFile(fs_.get(), fname, &writable_file, fo_copy);

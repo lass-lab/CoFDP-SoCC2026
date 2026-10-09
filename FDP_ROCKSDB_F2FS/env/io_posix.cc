@@ -32,6 +32,8 @@
 #include <sys/statfs.h>
 #include <sys/sysmacros.h>
 #endif
+#include "env/cofdp_stats.h"
+#include "env/pdir_placement.h"
 #include "monitoring/iostats_context_imp.h"
 #include "port/port.h"
 #include "port/stack_trace.h"
@@ -111,7 +113,8 @@ namespace {
 // cutting the buffer in 1GB chunks. We use this chunk size to be sure to keep
 // the writes aligned.
 
-bool PosixWrite(int fd, const char* buf, size_t nbyte) {
+bool PosixWrite(int fd, const char* buf, size_t nbyte,
+                CoFDPStats* cofdp_stats) {
   const size_t kLimit1Gb = 1UL << 30;
 
   const char* src = buf;
@@ -120,7 +123,11 @@ bool PosixWrite(int fd, const char* buf, size_t nbyte) {
   while (left != 0) {
     size_t bytes_to_write = std::min(left, kLimit1Gb);
 
-    ssize_t done = write(fd, src, bytes_to_write);
+    ssize_t done;
+    {
+      CoFDPStats::IoTimer timer(cofdp_stats, CoFDPStats::kWrite);
+      done = write(fd, src, bytes_to_write);
+    }
     if (done < 0) {
       if (errno == EINTR) {
         continue;
@@ -133,7 +140,8 @@ bool PosixWrite(int fd, const char* buf, size_t nbyte) {
   return true;
 }
 
-bool PosixPositionedWrite(int fd, const char* buf, size_t nbyte, off_t offset) {
+bool PosixPositionedWrite(int fd, const char* buf, size_t nbyte, off_t offset,
+                          CoFDPStats* cofdp_stats) {
   const size_t kLimit1Gb = 1UL << 30;
 
   const char* src = buf;
@@ -142,7 +150,11 @@ bool PosixPositionedWrite(int fd, const char* buf, size_t nbyte, off_t offset) {
   while (left != 0) {
     size_t bytes_to_write = std::min(left, kLimit1Gb);
 
-    ssize_t done = pwrite(fd, src, bytes_to_write, offset);
+    ssize_t done;
+    {
+      CoFDPStats::IoTimer timer(cofdp_stats, CoFDPStats::kPositionedWrite);
+      done = pwrite(fd, src, bytes_to_write, offset);
+    }
     if (done < 0) {
       if (errno == EINTR) {
         continue;
@@ -207,12 +219,14 @@ bool IsSyncFileRangeSupported(int fd) {
  */
 PosixSequentialFile::PosixSequentialFile(const std::string& fname, FILE* file,
                                          int fd, size_t logical_block_size,
-                                         const EnvOptions& options)
+                                         const EnvOptions& options,
+                                         CoFDPStats* cofdp_stats)
     : filename_(fname),
       file_(file),
       fd_(fd),
       use_direct_io_(options.use_direct_reads),
-      logical_sector_size_(logical_block_size) {
+      logical_sector_size_(logical_block_size),
+      cofdp_stats_(cofdp_stats) {
   assert(!options.use_direct_reads || !options.use_mmap_reads);
 }
 
@@ -265,7 +279,10 @@ IOStatus PosixSequentialFile::PositionedRead(uint64_t offset, size_t n,
   size_t left = n;
   char* ptr = scratch;
   while (left > 0) {
-    r = pread(fd_, ptr, left, static_cast<off_t>(offset));
+    {
+      CoFDPStats::IoTimer timer(cofdp_stats_, CoFDPStats::kSequentialFileRead);
+      r = pread(fd_, ptr, left, static_cast<off_t>(offset));
+    }
     if (r <= 0) {
       if (r == -1 && errno == EINTR) {
         continue;
@@ -586,7 +603,7 @@ size_t PosixHelper::GetQueueSysfsFileValueOfFd(
  */
 PosixRandomAccessFile::PosixRandomAccessFile(
     const std::string& fname, int fd, size_t logical_block_size,
-    const EnvOptions& options
+    const EnvOptions& options, CoFDPStats* cofdp_stats
 #if defined(ROCKSDB_IOURING_PRESENT)
     ,
     ThreadLocalPtr* thread_local_io_urings
@@ -595,7 +612,8 @@ PosixRandomAccessFile::PosixRandomAccessFile(
     : filename_(fname),
       fd_(fd),
       use_direct_io_(options.use_direct_reads),
-      logical_sector_size_(logical_block_size)
+      logical_sector_size_(logical_block_size),
+      cofdp_stats_(cofdp_stats)
 #if defined(ROCKSDB_IOURING_PRESENT)
       ,
       thread_local_io_urings_(thread_local_io_urings)
@@ -621,7 +639,11 @@ IOStatus PosixRandomAccessFile::Read(uint64_t offset, size_t n,
   size_t left = n;
   char* ptr = scratch;
   while (left > 0) {
-    r = pread(fd_, ptr, left, static_cast<off_t>(offset));
+    {
+      CoFDPStats::IoTimer timer(cofdp_stats_,
+                                CoFDPStats::kRandomAccessFileRead);
+      r = pread(fd_, ptr, left, static_cast<off_t>(offset));
+    }
     if (r <= 0) {
       if (r == -1 && errno == EINTR) {
         continue;
@@ -1317,13 +1339,15 @@ IOStatus PosixMmapFile::Allocate(uint64_t offset, uint64_t len,
  */
 PosixWritableFile::PosixWritableFile(const std::string& fname, int fd,
                                      size_t logical_block_size,
-                                     const EnvOptions& options)
+                                     const EnvOptions& options,
+                                     CoFDPStats* cofdp_stats)
     : FSWritableFile(options),
       filename_(fname),
       use_direct_io_(options.use_direct_writes),
       fd_(fd),
       filesize_(0),
-      logical_sector_size_(logical_block_size) {
+      logical_sector_size_(logical_block_size),
+      cofdp_stats_(cofdp_stats) {
 #ifdef ROCKSDB_FALLOCATE_PRESENT
   allow_fallocate_ = options.allow_fallocate;
   fallocate_with_keep_size_ = options.fallocate_with_keep_size;
@@ -1350,7 +1374,7 @@ IOStatus PosixWritableFile::Append(const Slice& data, const IOOptions& /*opts*/,
   const char* src = data.data();
   size_t nbytes = data.size();
 
-  if (!PosixWrite(fd_, src, nbytes)) {
+  if (!PosixWrite(fd_, src, nbytes, cofdp_stats_)) {
     return IOError("While appending to file", filename_, errno);
   }
 
@@ -1369,7 +1393,8 @@ IOStatus PosixWritableFile::PositionedAppend(const Slice& data, uint64_t offset,
   assert(offset <= static_cast<uint64_t>(std::numeric_limits<off_t>::max()));
   const char* src = data.data();
   size_t nbytes = data.size();
-  if (!PosixPositionedWrite(fd_, src, nbytes, static_cast<off_t>(offset))) {
+  if (!PosixPositionedWrite(fd_, src, nbytes, static_cast<off_t>(offset),
+                            cofdp_stats_)) {
     return IOError("While pwrite to file at offset " + std::to_string(offset),
                    filename_, errno);
   }
@@ -1454,6 +1479,7 @@ IOStatus PosixWritableFile::Sync(const IOOptions& /*opts*/,
     return IOError("while fcntl(F_FULLFSYNC)", filename_, errno);
   }
 #else   // HAVE_FULLFSYNC
+  CoFDPStats::IoTimer timer(cofdp_stats_, CoFDPStats::kWritableFileSync);
   if (fdatasync(fd_) < 0) {
     return IOError("While fdatasync", filename_, errno);
   }
@@ -1584,8 +1610,9 @@ size_t PosixWritableFile::GetUniqueId(char* id, size_t max_size) const {
  */
 
 PosixRandomRWFile::PosixRandomRWFile(const std::string& fname, int fd,
-                                     const EnvOptions& /*options*/)
-    : filename_(fname), fd_(fd) {}
+                                     const EnvOptions& /*options*/,
+                                     CoFDPStats* cofdp_stats)
+    : filename_(fname), fd_(fd), cofdp_stats_(cofdp_stats) {}
 
 PosixRandomRWFile::~PosixRandomRWFile() {
   if (fd_ >= 0) {
@@ -1599,7 +1626,9 @@ IOStatus PosixRandomRWFile::Write(uint64_t offset, const Slice& data,
                                   IODebugContext* /*dbg*/) {
   const char* src = data.data();
   size_t nbytes = data.size();
-  if (!PosixPositionedWrite(fd_, src, nbytes, static_cast<off_t>(offset))) {
+  // Writes to random read/write files are not part of the I/O breakdown.
+  if (!PosixPositionedWrite(fd_, src, nbytes, static_cast<off_t>(offset),
+                            /*cofdp_stats=*/nullptr)) {
     return IOError("While write random read/write file at offset " +
                        std::to_string(offset),
                    filename_, errno);
@@ -1614,7 +1643,11 @@ IOStatus PosixRandomRWFile::Read(uint64_t offset, size_t n,
   size_t left = n;
   char* ptr = scratch;
   while (left > 0) {
-    ssize_t done = pread(fd_, ptr, left, offset);
+    ssize_t done;
+    {
+      CoFDPStats::IoTimer timer(cofdp_stats_, CoFDPStats::kRandomRWFileRead);
+      done = pread(fd_, ptr, left, offset);
+    }
     if (done < 0) {
       // error while reading from file
       if (errno == EINTR) {
@@ -1651,6 +1684,7 @@ IOStatus PosixRandomRWFile::Sync(const IOOptions& /*opts*/,
     return IOError("while fcntl(F_FULLFSYNC) random rw file", filename_, errno);
   }
 #else   // HAVE_FULLFSYNC
+  CoFDPStats::IoTimer timer(cofdp_stats_, CoFDPStats::kRandomRWFileSync);
   if (fdatasync(fd_) < 0) {
     return IOError("While fdatasync random read/write file", filename_, errno);
   }
@@ -1693,8 +1727,9 @@ PosixMemoryMappedFileBuffer::~PosixMemoryMappedFileBuffer() {
 // The magic number for BTRFS is fixed, if it's not defined, define it here
 #define BTRFS_SUPER_MAGIC 0x9123683E
 #endif
-PosixDirectory::PosixDirectory(int fd, const std::string& directory_name)
-    : fd_(fd), directory_name_(directory_name) {
+PosixDirectory::PosixDirectory(int fd, const std::string& directory_name,
+                               PDirPlacement* pdir)
+    : fd_(fd), directory_name_(directory_name), pdir_(pdir) {
   is_btrfs_ = false;
 #ifdef OS_LINUX
   struct statfs buf;
@@ -1772,7 +1807,12 @@ IOStatus PosixDirectory::FsyncWithDirOptions(
     return IOError("while fcntl(F_FULLFSYNC)", "a directory", errno);
   }
 #else   // HAVE_FULLFSYNC
-  if (fd_ != -1 && fsync(fd_) == -1) {
+  if (dir_fsync_options.pdir_class != kPDirClassOwnDir && pdir_ != nullptr &&
+      pdir_->num_pdirs() > 0) {
+    // CoFDP: the new file was placed in a P-Directory; fsync that directory
+    // instead of this one (env/pdir_placement.h).
+    pdir_->FsyncPDir(dir_fsync_options.pdir_class);
+  } else if (fd_ != -1 && fsync(fd_) == -1) {
     s = IOError("While fsync", "a directory", errno);
   }
 #endif  // HAVE_FULLFSYNC

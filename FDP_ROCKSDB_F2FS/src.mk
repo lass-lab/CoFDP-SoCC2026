@@ -105,6 +105,7 @@ LIB_SOURCES =                                                   \
   db/write_controller.cc                                        \
   db/write_stall_stats.cc                                       \
   db/write_thread.cc                                            \
+  env/cofdp_stats.cc                                            \
   env/composite_env.cc                                          \
   env/env.cc                                                    \
   env/env_chroot.cc                                             \
@@ -117,6 +118,7 @@ LIB_SOURCES =                                                   \
   env/file_system_tracer.cc                                     \
   env/io_posix.cc                                               \
   env/mock_env.cc                                               \
+  env/pdir_placement.cc                                         \
   env/unique_id_gen.cc                                          \
   file/delete_scheduler.cc                                      \
   file/file_prefetch_buffer.cc                                  \

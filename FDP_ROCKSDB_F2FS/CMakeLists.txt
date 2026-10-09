@@ -1046,9 +1046,11 @@ endif()
 else()
   list(APPEND SOURCES
     port/port_posix.cc
+    env/cofdp_stats.cc
     env/env_posix.cc
     env/fs_posix.cc
-    env/io_posix.cc)
+    env/io_posix.cc
+    env/pdir_placement.cc)
 endif()
 
 if(USE_FOLLY_LITE)

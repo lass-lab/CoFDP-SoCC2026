@@ -269,10 +269,12 @@ class PosixSequentialFile : public FSSequentialFile {
   int fd_;
   bool use_direct_io_;
   size_t logical_sector_size_;
+  CoFDPStats* cofdp_stats_;
 
  public:
   PosixSequentialFile(const std::string& fname, FILE* file, int fd,
-                      size_t logical_block_size, const EnvOptions& options);
+                      size_t logical_block_size, const EnvOptions& options,
+                      CoFDPStats* cofdp_stats);
   virtual ~PosixSequentialFile();
 
   IOStatus Read(size_t n, const IOOptions& opts, Slice* result, char* scratch,
@@ -314,13 +316,15 @@ class PosixRandomAccessFile : public FSRandomAccessFile {
   int fd_;
   bool use_direct_io_;
   size_t logical_sector_size_;
+  CoFDPStats* cofdp_stats_;
 #if defined(ROCKSDB_IOURING_PRESENT)
   ThreadLocalPtr* thread_local_io_urings_;
 #endif
 
  public:
   PosixRandomAccessFile(const std::string& fname, int fd,
-                        size_t logical_block_size, const EnvOptions& options
+                        size_t logical_block_size, const EnvOptions& options,
+                        CoFDPStats* cofdp_stats
 #if defined(ROCKSDB_IOURING_PRESENT)
                         ,
                         ThreadLocalPtr* thread_local_io_urings
@@ -361,6 +365,7 @@ class PosixWritableFile : public FSWritableFile {
   int fd_;
   uint64_t filesize_;
   size_t logical_sector_size_;
+  CoFDPStats* cofdp_stats_;
 #ifdef ROCKSDB_FALLOCATE_PRESENT
   bool allow_fallocate_;
   bool fallocate_with_keep_size_;
@@ -374,7 +379,8 @@ class PosixWritableFile : public FSWritableFile {
  public:
   explicit PosixWritableFile(const std::string& fname, int fd,
                              size_t logical_block_size,
-                             const EnvOptions& options);
+                             const EnvOptions& options,
+                             CoFDPStats* cofdp_stats);
   virtual ~PosixWritableFile();
 
   // Need to implement this so the file is truncated correctly
@@ -500,7 +506,8 @@ class PosixMmapFile : public FSWritableFile {
 class PosixRandomRWFile : public FSRandomRWFile {
  public:
   explicit PosixRandomRWFile(const std::string& fname, int fd,
-                             const EnvOptions& options);
+                             const EnvOptions& options,
+                             CoFDPStats* cofdp_stats);
   virtual ~PosixRandomRWFile();
 
   IOStatus Write(uint64_t offset, const Slice& data, const IOOptions& opts,
@@ -517,6 +524,7 @@ class PosixRandomRWFile : public FSRandomRWFile {
  private:
   const std::string filename_;
   int fd_;
+  CoFDPStats* cofdp_stats_;
 };
 
 struct PosixMemoryMappedFileBuffer : public MemoryMappedFileBuffer {
@@ -527,7 +535,10 @@ struct PosixMemoryMappedFileBuffer : public MemoryMappedFileBuffer {
 
 class PosixDirectory : public FSDirectory {
  public:
-  explicit PosixDirectory(int fd, const std::string& directory_name);
+  // `pdir` holds the P-Directories that FsyncWithDirOptions() may sync instead
+  // of this directory.
+  explicit PosixDirectory(int fd, const std::string& directory_name,
+                          PDirPlacement* pdir);
   ~PosixDirectory();
   IOStatus Fsync(const IOOptions& opts, IODebugContext* dbg) override;
 
@@ -541,6 +552,7 @@ class PosixDirectory : public FSDirectory {
   int fd_;
   bool is_btrfs_;
   const std::string directory_name_;
+  PDirPlacement* pdir_;
 };
 
 }  // namespace ROCKSDB_NAMESPACE

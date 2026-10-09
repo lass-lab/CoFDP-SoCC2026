@@ -49,6 +49,8 @@ struct ImmutableDBOptions;
 struct MutableDBOptions;
 class RateLimiter;
 struct ConfigOptions;
+class CoFDPStats;     // env/cofdp_stats.h
+class PDirPlacement;  // env/pdir_placement.h
 
 using AccessPattern = RandomAccessFile::AccessPattern;
 using FileAttributes = Env::FileAttributes;
@@ -166,11 +168,18 @@ struct DirFsyncOptions {
   std::string renamed_new_name;  // for kFileRenamed
   // add other options for other FsyncReason
 
+  // CoFDP: when the file system has P-Directories, the P-Directory to fsync
+  // instead of this directory; 0 fsyncs this directory. See
+  // env/pdir_placement.h.
+  int pdir_class = 0;
+
   DirFsyncOptions();
 
   explicit DirFsyncOptions(std::string file_renamed_new_name);
 
   explicit DirFsyncOptions(FsyncReason fsync_reason);
+
+  DirFsyncOptions(FsyncReason fsync_reason, int fsync_pdir_class);
 };
 
 // File scope options that control how a file is opened/created and accessed
@@ -300,6 +309,13 @@ class FileSystem : public Customizable {
 
   static const char* Type() { return "FileSystem"; }
   static const char* kDefaultName() { return "DefaultFileSystem"; }
+
+  // CoFDP extensions (see docs/COFDP.md): the P-Directory placement shim and
+  // the experiment instrumentation. Only PosixFileSystem provides them; for
+  // every other FileSystem, including wrappers, both are nullptr and the
+  // CoFDP hooks in RocksDB do nothing.
+  PDirPlacement* pdir_placement() const { return pdir_placement_; }
+  CoFDPStats* cofdp_stats() const { return cofdp_stats_; }
 
   // Loads the FileSystem specified by the input value into the result
   // @see Customizable for a more detailed description of the parameters and
@@ -731,8 +747,18 @@ class FileSystem : public Customizable {
 
   // If you're adding methods here, remember to add them to EnvWrapper too.
 
+ protected:
+  // Publishes the CoFDP extensions of this file system; see pdir_placement().
+  void SetCoFDPExtensions(PDirPlacement* pdir, CoFDPStats* stats) {
+    pdir_placement_ = pdir;
+    cofdp_stats_ = stats;
+  }
+
  private:
   void operator=(const FileSystem&);
+
+  PDirPlacement* pdir_placement_ = nullptr;
+  CoFDPStats* cofdp_stats_ = nullptr;
 };
 
 // A file abstraction for reading sequentially through a file

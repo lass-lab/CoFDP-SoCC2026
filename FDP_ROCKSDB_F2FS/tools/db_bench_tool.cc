@@ -2347,7 +2347,8 @@ class Stats {
         } else {
           next_report_ += 100000;
         }
-        fprintf(stderr, "... finished %" PRIu64 " ops%30s\r", done_, "");
+        // CoFDP: unlike upstream, no "... finished <n> ops" progress line is
+        // printed here.
       } else {
         uint64_t now = clock_->NowMicros();
         int64_t usecs_since_last = now - last_report_finish_;
@@ -2371,9 +2372,13 @@ class Stats {
                   done_ / ((now - start_) / 1000000.0),
                   (now - last_report_finish_) / 1000000.0,
                   (now - start_) / 1000000.0);
+          // CoFDP: marks the end of each interval report in the stdout log.
+          printf("@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\n");
 
           if (id_ == 0 && FLAGS_stats_per_interval) {
             std::string stats;
+            // CoFDP: flush the marker before the statistics go to stderr.
+            fflush(stdout);
 
             if (db_with_cfh && db_with_cfh->num_created.load()) {
               for (size_t i = 0; i < db_with_cfh->num_created.load(); ++i) {
@@ -2715,13 +2720,15 @@ class Duration {
       auto granularity = FLAGS_ops_between_duration_checks;
       if ((ops_ / granularity) != ((ops_ - increment) / granularity)) {
         uint64_t now = FLAGS_env->NowMicros();
-        return ((now - start_at_) / 1000000) >= max_seconds_;
-      } else {
-        return false;
+        if (((now - start_at_) / 1000000) >= max_seconds_) {
+          return true;
+        }
       }
-    } else {
-      return ops_ > max_ops_;
     }
+    // CoFDP: unlike upstream, the op limit also applies when a duration is
+    // set; a run ends at whichever limit is reached first. See KNOWN_ISSUES
+    // (RDB-11).
+    return ops_ > max_ops_;
   }
 
  private:
@@ -6685,15 +6692,10 @@ class Benchmark {
             SineRate(usecs_since_start / 1000000.0), FLAGS_sine_mix_rate_noise);
         read_rate = mix_rate_with_noise * (query.ratio_[0] + query.ratio_[2]);
         write_rate = mix_rate_with_noise * query.ratio_[1];
-
-        if (read_rate > 0) {
-          thread->shared->read_rate_limiter->SetBytesPerSecond(
-              static_cast<int64_t>(read_rate));
-        }
-        if (write_rate > 0) {
-          thread->shared->write_rate_limiter->SetBytesPerSecond(
-              static_cast<int64_t>(write_rate));
-        }
+        // NOTE: this fork does not apply read_rate/write_rate to the rate
+        // limiters (upstream calls SetBytesPerSecond() here) and skips the
+        // limiter requests below, so MixGraph always runs unthrottled; see
+        // KNOWN_ISSUES (RDB-10).
       }
       // Start the query
       if (query_type == 0) {
@@ -6717,10 +6719,8 @@ class Benchmark {
           abort();
         }
 
-        if (thread->shared->read_rate_limiter && (gets + seek) % 100 == 0) {
-          thread->shared->read_rate_limiter->Request(100, Env::IO_HIGH,
-                                                     nullptr /*stats*/);
-        }
+        // NOTE: no read_rate_limiter request in this fork; see KNOWN_ISSUES
+        // (RDB-10).
         thread->stats.FinishedOps(db_with_cfh, db_with_cfh->db, 1, kRead);
       } else if (query_type == 1) {
         // the Put query
@@ -6742,10 +6742,8 @@ class Benchmark {
           ErrorExit();
         }
 
-        if (thread->shared->write_rate_limiter && puts % 100 == 0) {
-          thread->shared->write_rate_limiter->Request(100, Env::IO_HIGH,
-                                                      nullptr /*stats*/);
-        }
+        // NOTE: no write_rate_limiter request in this fork; see KNOWN_ISSUES
+        // (RDB-10).
         thread->stats.FinishedOps(db_with_cfh, db_with_cfh->db, 1, kWrite);
       } else if (query_type == 2) {
         // Seek query

@@ -47,8 +47,10 @@
 #include <set>
 #include <vector>
 
+#include "env/cofdp_stats.h"
 #include "env/composite_env_wrapper.h"
 #include "env/io_posix.h"
+#include "env/pdir_placement.h"
 #include "monitoring/iostats_context_imp.h"
 #include "monitoring/thread_status_updater.h"
 #include "options/db_options.h"
@@ -168,6 +170,7 @@ class PosixFileSystem : public FileSystem {
     int fd = -1;
     int flags = cloexec_flags(O_RDONLY, &options);
     FILE* file = nullptr;
+    CoFDPStats::IoTimer meta_timer(&stats_, CoFDPStats::kMeta);
 
     if (options.use_direct_reads && !options.use_mmap_reads) {
 #if !defined(OS_MACOSX) && !defined(OS_OPENBSD) && !defined(OS_SOLARIS)
@@ -176,13 +179,15 @@ class PosixFileSystem : public FileSystem {
 #endif
     }
 
+    const std::string resolved_fname = pdir_.Resolve(fname);
     do {
       IOSTATS_TIMER_GUARD(open_nanos);
-      fd = open(fname.c_str(), flags, GetDBFileMode(allow_non_owner_access_));
+      fd = open(resolved_fname.c_str(), flags,
+                GetDBFileMode(allow_non_owner_access_));
     } while (fd < 0 && errno == EINTR);
     if (fd < 0) {
-      return IOError("While opening a file for sequentially reading", fname,
-                     errno);
+      return IOError("While opening a file for sequentially reading",
+                     resolved_fname, errno);
     }
 
     SetFD_CLOEXEC(fd, &options);
@@ -207,7 +212,7 @@ class PosixFileSystem : public FileSystem {
     }
     result->reset(new PosixSequentialFile(
         fname, file, fd, GetLogicalBlockSizeForReadIfNeeded(options, fname, fd),
-        options));
+        options, &stats_));
     return IOStatus::OK();
   }
 
@@ -219,6 +224,7 @@ class PosixFileSystem : public FileSystem {
     IOStatus s = IOStatus::OK();
     int fd;
     int flags = cloexec_flags(O_RDONLY, &options);
+    CoFDPStats::IoTimer meta_timer(&stats_, CoFDPStats::kMeta);
 
     if (options.use_direct_reads && !options.use_mmap_reads) {
 #if !defined(OS_MACOSX) && !defined(OS_OPENBSD) && !defined(OS_SOLARIS)
@@ -227,12 +233,14 @@ class PosixFileSystem : public FileSystem {
 #endif
     }
 
+    const std::string resolved_fname = pdir_.Resolve(fname);
     do {
       IOSTATS_TIMER_GUARD(open_nanos);
-      fd = open(fname.c_str(), flags, GetDBFileMode(allow_non_owner_access_));
+      fd = open(resolved_fname.c_str(), flags,
+                GetDBFileMode(allow_non_owner_access_));
     } while (fd < 0 && errno == EINTR);
     if (fd < 0) {
-      s = IOError("While open a file for random read", fname, errno);
+      s = IOError("While open a file for random read", resolved_fname, errno);
       return s;
     }
     SetFD_CLOEXEC(fd, &options);
@@ -267,7 +275,7 @@ class PosixFileSystem : public FileSystem {
       }
       result->reset(new PosixRandomAccessFile(
           fname, fd, GetLogicalBlockSizeForReadIfNeeded(options, fname, fd),
-          options
+          options, &stats_
 #if defined(ROCKSDB_IOURING_PRESENT)
           ,
           !IsIOUringEnabled() ? nullptr : thread_local_io_urings_.get()
@@ -285,6 +293,7 @@ class PosixFileSystem : public FileSystem {
     IOStatus s;
     int fd = -1;
     int flags = (reopen) ? (O_CREAT | O_APPEND) : (O_CREAT | O_TRUNC);
+    CoFDPStats::IoTimer meta_timer(&stats_, CoFDPStats::kMeta);
     // Direct IO mode with O_DIRECT flag or F_NOCAHCE (MAC OSX)
     if (options.use_direct_writes && !options.use_mmap_writes) {
       // Note: we should avoid O_APPEND here due to ta the following bug:
@@ -308,13 +317,15 @@ class PosixFileSystem : public FileSystem {
 
     flags = cloexec_flags(flags, &options);
 
+    const std::string resolved_fname = pdir_.Resolve(fname);
     do {
       IOSTATS_TIMER_GUARD(open_nanos);
-      fd = open(fname.c_str(), flags, GetDBFileMode(allow_non_owner_access_));
+      fd = open(resolved_fname.c_str(), flags,
+                GetDBFileMode(allow_non_owner_access_));
     } while (fd < 0 && errno == EINTR);
 
     if (fd < 0) {
-      s = IOError("While open a file for appending", fname, errno);
+      s = IOError("While open a file for appending", resolved_fname, errno);
       return s;
     }
     SetFD_CLOEXEC(fd, &options);
@@ -343,7 +354,7 @@ class PosixFileSystem : public FileSystem {
 #endif
       result->reset(new PosixWritableFile(
           fname, fd, GetLogicalBlockSizeForWriteIfNeeded(options, fname, fd),
-          options));
+          options, &stats_));
     } else {
       // disable mmap writes
       EnvOptions no_mmap_writes_options = options;
@@ -352,7 +363,7 @@ class PosixFileSystem : public FileSystem {
           new PosixWritableFile(fname, fd,
                                 GetLogicalBlockSizeForWriteIfNeeded(
                                     no_mmap_writes_options, fname, fd),
-                                no_mmap_writes_options));
+                                no_mmap_writes_options, &stats_));
     }
     return s;
   }
@@ -380,6 +391,7 @@ class PosixFileSystem : public FileSystem {
     int fd = -1;
 
     int flags = 0;
+    CoFDPStats::IoTimer meta_timer(&stats_, CoFDPStats::kMeta);
     // Direct IO mode with O_DIRECT flag or F_NOCAHCE (MAC OSX)
     if (options.use_direct_writes && !options.use_mmap_writes) {
       flags |= O_WRONLY;
@@ -396,9 +408,11 @@ class PosixFileSystem : public FileSystem {
 
     flags = cloexec_flags(flags, &options);
 
+    const std::string resolved_old_fname = pdir_.Resolve(old_fname);
+    const std::string resolved_fname = pdir_.Resolve(fname);
     do {
       IOSTATS_TIMER_GUARD(open_nanos);
-      fd = open(old_fname.c_str(), flags,
+      fd = open(resolved_old_fname.c_str(), flags,
                 GetDBFileMode(allow_non_owner_access_));
     } while (fd < 0 && errno == EINTR);
     if (fd < 0) {
@@ -408,8 +422,9 @@ class PosixFileSystem : public FileSystem {
 
     SetFD_CLOEXEC(fd, &options);
     // rename into place
-    if (rename(old_fname.c_str(), fname.c_str()) != 0) {
-      s = IOError("while rename file to " + fname, old_fname, errno);
+    if (rename(resolved_old_fname.c_str(), resolved_fname.c_str()) != 0) {
+      s = IOError("while rename file to " + resolved_fname, resolved_old_fname,
+                  errno);
       close(fd);
       return s;
     }
@@ -438,7 +453,7 @@ class PosixFileSystem : public FileSystem {
 #endif
       result->reset(new PosixWritableFile(
           fname, fd, GetLogicalBlockSizeForWriteIfNeeded(options, fname, fd),
-          options));
+          options, &stats_));
     } else {
       // disable mmap writes
       FileOptions no_mmap_writes_options = options;
@@ -447,7 +462,7 @@ class PosixFileSystem : public FileSystem {
           new PosixWritableFile(fname, fd,
                                 GetLogicalBlockSizeForWriteIfNeeded(
                                     no_mmap_writes_options, fname, fd),
-                                no_mmap_writes_options));
+                                no_mmap_writes_options, &stats_));
     }
     return s;
   }
@@ -472,7 +487,7 @@ class PosixFileSystem : public FileSystem {
     }
 
     SetFD_CLOEXEC(fd, &options);
-    result->reset(new PosixRandomRWFile(fname, fd, options));
+    result->reset(new PosixRandomRWFile(fname, fd, options, &stats_));
     return IOStatus::OK();
   }
 
@@ -483,9 +498,10 @@ class PosixFileSystem : public FileSystem {
     IOStatus status;
     int flags = cloexec_flags(O_RDWR, nullptr);
 
+    const std::string resolved_fname = pdir_.Resolve(fname);
     while (fd < 0) {
       IOSTATS_TIMER_GUARD(open_nanos);
-      fd = open(fname.c_str(), flags, 0644);
+      fd = open(resolved_fname.c_str(), flags, 0644);
       if (fd < 0) {
         // Error while opening the file
         if (errno == EINTR) {
@@ -533,7 +549,7 @@ class PosixFileSystem : public FileSystem {
     if (fd < 0) {
       return IOError("While open directory", name, errno);
     } else {
-      result->reset(new PosixDirectory(fd, name));
+      result->reset(new PosixDirectory(fd, name, &pdir_));
     }
     return IOStatus::OK();
   }
@@ -621,9 +637,14 @@ class PosixFileSystem : public FileSystem {
   IOStatus DeleteFile(const std::string& fname, const IOOptions& /*opts*/,
                       IODebugContext* /*dbg*/) override {
     IOStatus result;
-    if (unlink(fname.c_str()) != 0) {
+    CoFDPStats::IoTimer meta_timer(&stats_, CoFDPStats::kMeta);
+    const std::string resolved_fname = pdir_.Resolve(fname);
+    if (unlink(resolved_fname.c_str()) != 0) {
       result = IOError("while unlink() file", fname, errno);
     }
+    // NOTE: this forgets the resolved path rather than fname, so the cached
+    // resolution of fname survives the deletion; see KNOWN_ISSUES (RDB-7).
+    pdir_.ForgetPath(resolved_fname);
     return result;
   }
 
@@ -662,9 +683,11 @@ class PosixFileSystem : public FileSystem {
   IOStatus GetFileSize(const std::string& fname, const IOOptions& /*opts*/,
                        uint64_t* size, IODebugContext* /*dbg*/) override {
     struct stat sbuf;
-    if (stat(fname.c_str(), &sbuf) != 0) {
+    CoFDPStats::IoTimer meta_timer(&stats_, CoFDPStats::kMeta);
+    const std::string resolved_fname = pdir_.Resolve(fname);
+    if (stat(resolved_fname.c_str(), &sbuf) != 0) {
       *size = 0;
-      return IOError("while stat a file for size", fname, errno);
+      return IOError("while stat a file for size", resolved_fname, errno);
     } else {
       *size = sbuf.st_size;
     }
@@ -686,8 +709,12 @@ class PosixFileSystem : public FileSystem {
   IOStatus RenameFile(const std::string& src, const std::string& target,
                       const IOOptions& /*opts*/,
                       IODebugContext* /*dbg*/) override {
-    if (rename(src.c_str(), target.c_str()) != 0) {
-      return IOError("While renaming a file to " + target, src, errno);
+    CoFDPStats::IoTimer meta_timer(&stats_, CoFDPStats::kMeta);
+    const std::string resolved_target = pdir_.Resolve(target);
+    const std::string resolved_src = pdir_.Resolve(src);
+    if (rename(resolved_src.c_str(), resolved_target.c_str()) != 0) {
+      return IOError("While renaming a file to " + resolved_target,
+                     resolved_src, errno);
     }
     return IOStatus::OK();
   }
@@ -750,6 +777,7 @@ class PosixFileSystem : public FileSystem {
     lhi.acquire_time = current_time;
     lhi.acquiring_thread = Env::Default()->GetThreadID();
 
+    CoFDPStats::IoTimer meta_timer(&stats_, CoFDPStats::kMeta);
     mutex_locked_files.Lock();
     // If it already exists in the locked_files set, then it is already locked,
     // and fail this lock attempt. Otherwise, insert it into locked_files.
@@ -778,14 +806,15 @@ class PosixFileSystem : public FileSystem {
     int fd;
     int flags = cloexec_flags(O_RDWR | O_CREAT, nullptr);
 
+    const std::string resolved_fname = pdir_.Resolve(fname);
     {
       IOSTATS_TIMER_GUARD(open_nanos);
-      fd = open(fname.c_str(), flags, 0644);
+      fd = open(resolved_fname.c_str(), flags, 0644);
     }
     if (fd < 0) {
-      result = IOError("while open a file for lock", fname, errno);
+      result = IOError("while open a file for lock", resolved_fname, errno);
     } else if (LockOrUnlock(fd, true) == -1) {
-      result = IOError("While lock file", fname, errno);
+      result = IOError("While lock file", resolved_fname, errno);
       close(fd);
     } else {
       SetFD_CLOEXEC(fd, nullptr);
@@ -955,6 +984,10 @@ class PosixFileSystem : public FileSystem {
 
 #ifdef OS_LINUX
   Status RegisterDbPaths(const std::vector<std::string>& paths) override {
+    // CoFDP: the P-Directories are taken from the first DB path only.
+    if (!paths.empty()) {
+      pdir_.Discover(paths[0]);
+    }
     return logical_block_size_cache_.RefAndCacheLogicalBlockSize(paths);
   }
   Status UnregisterDbPaths(const std::vector<std::string>& paths) override {
@@ -1256,6 +1289,11 @@ class PosixFileSystem : public FileSystem {
   //  has no access to db files.
   bool allow_non_owner_access_;
 
+  // CoFDP extensions (docs/COFDP.md), published through
+  // FileSystem::pdir_placement() and FileSystem::cofdp_stats().
+  PDirPlacement pdir_;
+  CoFDPStats stats_;
+
 #ifdef OS_LINUX
   static LogicalBlockSizeCache logical_block_size_cache_;
 #endif
@@ -1301,6 +1339,8 @@ PosixFileSystem::PosixFileSystem()
     : forceMmapOff_(false),
       page_size_(getpagesize()),
       allow_non_owner_access_(true) {
+  SetCoFDPExtensions(&pdir_, &stats_);
+  stats_.StartOpsTimeline();
 #if defined(ROCKSDB_IOURING_PRESENT)
   // Test whether IOUring is supported, and if it does, create a managing
   // object for thread local point so that in the future thread-local

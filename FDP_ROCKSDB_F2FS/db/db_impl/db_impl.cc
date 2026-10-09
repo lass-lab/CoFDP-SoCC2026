@@ -56,6 +56,8 @@
 #include "db/version_set.h"
 #include "db/write_batch_internal.h"
 #include "db/write_callback.h"
+#include "env/cofdp_stats.h"
+#include "env/pdir_placement.h"
 #include "env/unique_id_gen.h"
 #include "file/file_util.h"
 #include "file/filename.h"
@@ -295,6 +297,11 @@ DBImpl::DBImpl(const DBOptions& options, const std::string& dbname,
       &error_handler_, read_only));
   column_family_memtables_.reset(
       new ColumnFamilyMemTablesImpl(versions_->GetColumnFamilySet()));
+  // CoFDP: from now on the P-Directory placement shim rewrites file paths
+  // (env/pdir_placement.h).
+  if (PDirPlacement* pdir = fs_->pdir_placement()) {
+    pdir->NotifyDbOpened();
+  }
 
   DumpRocksDBBuildVersion(immutable_db_options_.info_log.get());
   DumpDBFileSummary(immutable_db_options_, dbname_, db_session_id_);
@@ -752,6 +759,10 @@ DBImpl::~DBImpl() {
   ThreadStatus::OperationType cur_op_type =
       ThreadStatusUtil::GetThreadOperation();
   ThreadStatusUtil::SetThreadOperation(ThreadStatus::OperationType::OP_UNKNOWN);
+  // CoFDP: print the I/O latency breakdown (env/cofdp_stats.h).
+  if (CoFDPStats* cofdp_stats = immutable_db_options_.fs->cofdp_stats()) {
+    cofdp_stats->PrintIoBreakdown();
+  }
 
   // TODO: remove this.
   init_logger_creation_s_.PermitUncheckedError();
@@ -2362,6 +2373,10 @@ Status DBImpl::GetImpl(const ReadOptions& read_options, const Slice& key,
   PERF_CPU_TIMER_GUARD(get_cpu_nanos, immutable_db_options_.clock);
   StopWatch sw(immutable_db_options_.clock, stats_, DB_GET);
   PERF_TIMER_GUARD(get_snapshot_time);
+  // CoFDP ops timeline: count this Get and time the rest of it (GET line).
+  CoFDPStats* const cofdp_stats = immutable_db_options_.fs->cofdp_stats();
+  CoFDPStats::CountDbOp(cofdp_stats, CoFDPStats::kDbGet);
+  CoFDPStats::OpTimer get_timer(cofdp_stats, CoFDPStats::kDbGet);
 
   auto cfh = static_cast_with_check<ColumnFamilyHandleImpl>(
       get_impl_options.column_family);
@@ -3889,6 +3904,10 @@ Iterator* DBImpl::NewIterator(const ReadOptions& _read_options,
       return NewErrorIterator(s);
     }
   }
+  // CoFDP ops timeline: time the creation of the iterator (SCAN line).
+  CoFDPStats* const cofdp_stats = immutable_db_options_.fs->cofdp_stats();
+  CoFDPStats::OpTimer new_iterator_timer(cofdp_stats,
+                                         CoFDPStats::kDbNewIterator);
   if (read_options.tailing) {
     read_options.total_order_seek |=
         immutable_db_options_.prefix_seek_opt_in_only;
@@ -3910,6 +3929,8 @@ Iterator* DBImpl::NewIterator(const ReadOptions& _read_options,
                                  : kMaxSequenceNumber,
                              nullptr /* read_callback */);
   }
+  new_iterator_timer.Stop();
+  CoFDPStats::CountDbOp(cofdp_stats, CoFDPStats::kDbNewIterator);
   return result;
 }
 

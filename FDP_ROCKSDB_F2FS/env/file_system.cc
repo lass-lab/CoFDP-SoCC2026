@@ -280,4 +280,9 @@ DirFsyncOptions::DirFsyncOptions(FsyncReason fsync_reason) {
   assert(fsync_reason != kFileRenamed);
   reason = fsync_reason;
 }
+
+DirFsyncOptions::DirFsyncOptions(FsyncReason fsync_reason, int fsync_pdir_class)
+    : DirFsyncOptions(fsync_reason) {
+  pdir_class = fsync_pdir_class;
+}
 }  // namespace ROCKSDB_NAMESPACE

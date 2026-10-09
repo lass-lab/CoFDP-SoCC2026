@@ -13,6 +13,7 @@
 #include "db/db_impl/db_impl.h"
 #include "db/error_handler.h"
 #include "db/event_helpers.h"
+#include "env/pdir_placement.h"
 #include "file/sst_file_manager_impl.h"
 #include "logging/logging.h"
 #include "monitoring/iostats_context_imp.h"
@@ -622,9 +623,12 @@ Status DBImpl::AtomicFlushMemTablesToOutputFiles(
         Status error_status =
             WritableFileWriter::PrepareIOOptions(write_options, io_options);
         if (error_status.ok()) {
+          // CoFDP: sync the L0 P-Directory instead of the DB directory
+          // (env/pdir_placement.h).
           error_status = dir->FsyncWithDirOptions(
               io_options, nullptr,
-              DirFsyncOptions(DirFsyncOptions::FsyncReason::kNewFileSynced));
+              DirFsyncOptions(DirFsyncOptions::FsyncReason::kNewFileSynced,
+                              PDirClassForSstLevel(0)));
         }
         if (!error_status.ok()) {
           s = error_status;

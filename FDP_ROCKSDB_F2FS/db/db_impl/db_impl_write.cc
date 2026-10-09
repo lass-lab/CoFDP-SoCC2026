@@ -11,6 +11,8 @@
 #include "db/db_impl/db_impl.h"
 #include "db/error_handler.h"
 #include "db/event_helpers.h"
+#include "env/cofdp_stats.h"
+#include "env/pdir_placement.h"
 #include "logging/logging.h"
 #include "memtable/wbwi_memtable.h"
 #include "monitoring/perf_context_imp.h"
@@ -154,7 +156,11 @@ Status DBImpl::Write(const WriteOptions& write_options, WriteBatch* my_batch) {
     s = WriteBatchInternal::UpdateProtectionInfo(
         my_batch, write_options.protection_bytes_per_key);
   }
+  // CoFDP ops timeline: count the batch and time WriteImpl() (PUT line).
+  CoFDPStats* const cofdp_stats = immutable_db_options_.fs->cofdp_stats();
+  CoFDPStats::CountDbOp(cofdp_stats, CoFDPStats::kDbWrite);
   if (s.ok()) {
+    CoFDPStats::OpTimer write_timer(cofdp_stats, CoFDPStats::kDbWrite);
     s = WriteImpl(write_options, my_batch, /*callback=*/nullptr,
                   /*user_write_cb=*/nullptr,
                   /*log_used=*/nullptr);
@@ -1689,9 +1695,12 @@ IOStatus DBImpl::WriteToWAL(const WriteThread::WriteGroup& write_group,
       // We only sync WAL directory the first time WAL syncing is
       // requested, so that in case users never turn on WAL sync,
       // we can avoid the disk I/O in the write code path.
+      // CoFDP: with P-Directories, sync the WAL P-Directory instead
+      // (env/pdir_placement.h).
       io_s = directories_.GetWalDir()->FsyncWithDirOptions(
           IOOptions(), nullptr,
-          DirFsyncOptions(DirFsyncOptions::FsyncReason::kNewFileSynced));
+          DirFsyncOptions(DirFsyncOptions::FsyncReason::kNewFileSynced,
+                          kPDirClassWal));
     }
   }
 

@@ -23,6 +23,7 @@
 #include "db/range_del_aggregator.h"
 #include "db/table_cache.h"
 #include "db/version_edit.h"
+#include "env/pdir_placement.h"
 #include "file/file_util.h"
 #include "file/filename.h"
 #include "file/read_write_util.h"
@@ -103,6 +104,11 @@ Status BuildTable(
 
   std::string fname = TableFileName(ioptions.cf_paths, meta->fd.GetNumber(),
                                     meta->fd.GetPathId());
+  // CoFDP: the P-Directory placement shim places SSTs by creation level.
+  if (PDirPlacement* pdir = ioptions.fs->pdir_placement()) {
+    pdir->RecordSstCreationLevel(meta->fd.GetNumber(),
+                                 tboptions.level_at_creation);
+  }
   std::vector<std::string> blob_file_paths;
   std::string file_checksum = kUnknownFileChecksum;
   std::string file_checksum_func_name = kUnknownFileChecksumFuncName;
