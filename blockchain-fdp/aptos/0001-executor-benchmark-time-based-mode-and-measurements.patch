@@ -1,0 +1,614 @@
+executor-benchmark: time-based mode, block count and execution latency reporting
+
+* BENCHMARK_DURATION_SECS: stop generating blocks after the given time
+  (time-based runs); unset keeps the block-count behaviour.
+* "Overall" results also report the elapsed time (HH:MM:SS), the number of
+  generated blocks and blocks/s (log lines and JSON).
+* aptos-block-executor records the execution time of transaction incarnations;
+  executor-benchmark prints their p10..p99.999 ("<prefix> pXX: N us").
+* create-db accepts an existing data directory (P-Directories are bind-mounted
+  onto its subdirectories before the run).
+
+Base: aptos-labs/aptos-core main at commit
+      2f99b2fbeb63ee3ee4d8fbdbd1aba164e39ed7b8 (2025-12-29)
+Apply: git apply 0001-executor-benchmark-time-based-mode-and-measurements.patch
+License: this patch modifies aptos-core and is subject to aptos-core's
+         Innovation-Enabling Source Code License (see LICENSE and README.md).
+
+diff --git a/aptos-move/block-executor/src/counters.rs b/aptos-move/block-executor/src/counters.rs
+index b488378e9a..9ebecdc45c 100644
+--- a/aptos-move/block-executor/src/counters.rs
++++ b/aptos-move/block-executor/src/counters.rs
+@@ -11,6 +11,7 @@ use aptos_mvhashmap::BlockStateStats;
+ use aptos_types::fee_statement::FeeStatement;
+ use move_vm_runtime::execution_tracing::Trace;
+ use once_cell::sync::Lazy;
++use std::{cell::RefCell, sync::Mutex};
+ 
+ pub struct GasType;
+ 
+@@ -471,3 +472,61 @@ pub(crate) fn update_txn_trace_counters(trace: &Trace) {
+     );
+     TRACE_COUNTERS.set_with(&["num_calls"], trace.num_recorded_calls() as i64);
+ }
++
++// Execution latency of each transaction in microseconds, reported by the
++// executor benchmark. Samples are buffered per thread so that recording stays
++// lock-free; flush_thread_latencies() moves the calling thread's buffer into a
++// global list that get_all_latencies() returns.
++//
++// NOTE: only the thread calling get_all_latencies() is flushed, samples left in
++// other threads' buffers are not reported; see CoFDP KNOWN_ISSUES (BC-2).
++thread_local! {
++    static THREAD_LATENCIES: RefCell<Vec<u64>> = RefCell::new(Vec::new());
++}
++
++static AGGREGATED_LATENCIES: Lazy<Mutex<Vec<Vec<u64>>>> = Lazy::new(|| Mutex::new(Vec::new()));
++
++/// Records the execution latency of one transaction, in microseconds.
++pub fn record_task_latency_us(duration_us: u64) {
++    THREAD_LATENCIES.with(|latencies| {
++        latencies.borrow_mut().push(duration_us);
++    });
++}
++
++/// Moves the samples buffered by the calling thread into the global list.
++pub fn flush_thread_latencies() {
++    THREAD_LATENCIES.with(|latencies| {
++        let mut local_data = latencies.borrow_mut();
++        if !local_data.is_empty() {
++            if let Ok(mut aggregated) = AGGREGATED_LATENCIES.lock() {
++                aggregated.push(local_data.drain(..).collect());
++            }
++        }
++    });
++}
++
++/// Discards the samples of the calling thread and of the global list.
++pub fn reset_latency_collector() {
++    THREAD_LATENCIES.with(|latencies| {
++        latencies.borrow_mut().clear();
++    });
++
++    if let Ok(mut aggregated) = AGGREGATED_LATENCIES.lock() {
++        aggregated.clear();
++    }
++}
++
++/// Flushes the calling thread and returns all samples of the global list.
++pub fn get_all_latencies() -> Vec<u64> {
++    flush_thread_latencies();
++
++    if let Ok(aggregated) = AGGREGATED_LATENCIES.lock() {
++        let mut combined = Vec::new();
++        for thread_data in aggregated.iter() {
++            combined.extend(thread_data);
++        }
++        combined
++    } else {
++        Vec::new()
++    }
++}
+diff --git a/aptos-move/block-executor/src/executor.rs b/aptos-move/block-executor/src/executor.rs
+index af3442bfeb..5c9b266c27 100644
+--- a/aptos-move/block-executor/src/executor.rs
++++ b/aptos-move/block-executor/src/executor.rs
+@@ -76,6 +76,7 @@ use std::{
+         atomic::{AtomicBool, AtomicU32, Ordering},
+         Arc,
+     },
++    time::Instant,
+ };
+ use triomphe::Arc as TriompheArc;
+ 
+@@ -408,6 +409,7 @@ where
+         block_gas_limit_type: &BlockGasLimitType,
+     ) -> Result<(), PanicError> {
+         let _timer = TASK_EXECUTE_SECONDS.start_timer();
++        let start_time = Instant::now();
+ 
+         let mut abort_manager = AbortManager::new(idx_to_execute, incarnation, scheduler);
+         let sync_view = LatestView::new(
+@@ -526,6 +528,9 @@ where
+                 true,
+             )?;
+         }
++        // Execution latency of this incarnation, reported by the executor benchmark.
++        let elapsed_us = start_time.elapsed().as_micros() as u64;
++        counters::record_task_latency_us(elapsed_us);
+         Ok(())
+     }
+ 
+@@ -552,6 +557,7 @@ where
+         block_gas_limit_type: &BlockGasLimitType,
+     ) -> Result<SchedulerTask, PanicError> {
+         let _timer = TASK_EXECUTE_SECONDS.start_timer();
++        let start_time = Instant::now();
+ 
+         // VM execution.
+         let sync_view = LatestView::new(
+@@ -705,6 +711,9 @@ where
+             block_gas_limit_type,
+             txn.user_txn_bytes_len() as u64,
+         )?;
++        // Execution latency of this incarnation, reported by the executor benchmark.
++        let elapsed_us = start_time.elapsed().as_micros() as u64;
++        counters::record_task_latency_us(elapsed_us);
+         if let Some(scheduler) = maybe_scheduler {
+             scheduler.finish_execution(idx_to_execute, incarnation, needs_suffix_validation)
+         } else {
+diff --git a/execution/executor-benchmark/src/db_generator.rs b/execution/executor-benchmark/src/db_generator.rs
+index f92b0a6424..62f266ac55 100644
+--- a/execution/executor-benchmark/src/db_generator.rs
++++ b/execution/executor-benchmark/src/db_generator.rs
+@@ -43,9 +43,10 @@ pub fn create_db_with_accounts<V>(
+ 
+     println!("Initializing...");
+ 
+-    if db_dir.as_ref().exists() {
+-        panic!("data-dir exists already.");
+-    }
++    // CoFDP: the data directory may already exist, because PiDir-Binding
++    // bind-mounts P-Directories onto its subdirectories before the run, so the
++    // upstream "data-dir exists already" check is skipped. A DB left over from
++    // a previous run is not detected; see CoFDP KNOWN_ISSUES (BC-13).
+     // create if not exists
+     fs::create_dir_all(db_dir.as_ref()).unwrap();
+ 
+diff --git a/execution/executor-benchmark/src/lib.rs b/execution/executor-benchmark/src/lib.rs
+index 75c0721f7a..7146941194 100644
+--- a/execution/executor-benchmark/src/lib.rs
++++ b/execution/executor-benchmark/src/lib.rs
+@@ -280,6 +280,7 @@ enum InitializedBenchmarkWorkload {
+ pub fn run_benchmark<V>(
+     block_size: usize,
+     num_blocks: usize,
++    benchmark_duration_secs: Option<u64>,
+     workload: BenchmarkWorkload,
+     mut transactions_per_sender: usize,
+     num_main_signer_accounts: usize,
+@@ -427,6 +428,7 @@ where
+             let num_blocks_created = generator.run_workload(
+                 block_size,
+                 num_blocks,
++                benchmark_duration_secs,
+                 transaction_generators,
+                 phase,
+                 transactions_per_sender,
+@@ -441,6 +443,7 @@ where
+             let num_blocks_created = generator.run_transfer(
+                 block_size,
+                 num_blocks,
++                benchmark_duration_secs,
+                 transactions_per_sender,
+                 connected_tx_grps,
+                 shuffle_connected_txns,
+@@ -466,8 +469,12 @@ where
+         num_pipeline_txns.unwrap_or_default()
+     };
+ 
+-    let overall_results =
+-        overall_measuring.elapsed("Overall".to_string(), "".to_string(), num_txns);
++    let overall_results = overall_measuring.elapsed(
++        "Overall".to_string(),
++        "".to_string(),
++        num_txns,
++        num_blocks_created as u64,
++    );
+     overall_results.print_end();
+ 
+     if !pipeline_config.skip_commit {
+@@ -905,6 +912,7 @@ pub fn run_single_with_default_params(
+     run_benchmark::<AptosVMBlockExecutor>(
+         benchmark_block_size, /* block_size */
+         num_blocks,           /* num_blocks */
++        None,                 /* benchmark_duration_secs */
+         BenchmarkWorkload::TransactionMix(vec![(transaction_type, 1)]),
+         1, /* transactions per sender */
+         num_main_signer_accounts,
+@@ -1208,8 +1216,9 @@ mod tests {
+         println!("run_benchmark");
+ 
+         super::run_benchmark::<E>(
+-            10, /* block_size */
+-            30, /* num_blocks */
++            10,   /* block_size */
++            30,   /* num_blocks */
++            None, /* benchmark_duration_secs */
+             transaction_type.map_or_else(
+                 || BenchmarkWorkload::Transfer {
+                     connected_tx_grps: 0,
+diff --git a/execution/executor-benchmark/src/main.rs b/execution/executor-benchmark/src/main.rs
+index 4b0ff62fb2..cb428aa0d5 100644
+--- a/execution/executor-benchmark/src/main.rs
++++ b/execution/executor-benchmark/src/main.rs
+@@ -547,9 +547,16 @@ where
+                 }
+             }
+ 
++            // Time-based runs: stop generating blocks once BENCHMARK_DURATION_SECS
++            // seconds have passed (unset: generate all --blocks).
++            let benchmark_duration_secs = std::env::var("BENCHMARK_DURATION_SECS")
++                .ok()
++                .and_then(|v| v.parse::<u64>().ok());
++
+             aptos_executor_benchmark::run_benchmark::<E>(
+                 opt.block_size,
+                 blocks,
++                benchmark_duration_secs,
+                 workload,
+                 opt.transactions_per_sender,
+                 main_signer_accounts,
+diff --git a/execution/executor-benchmark/src/measurements.rs b/execution/executor-benchmark/src/measurements.rs
+index 609acbbdd2..0b5d4320d0 100644
+--- a/execution/executor-benchmark/src/measurements.rs
++++ b/execution/executor-benchmark/src/measurements.rs
+@@ -18,6 +18,44 @@ use std::{
+     time::Instant,
+ };
+ 
++/// Nearest-rank percentiles of the transaction execution latencies (in
++/// microseconds) collected by aptos_block_executor::counters.
++fn calculate_percentiles_us(samples: &mut Vec<u64>) -> BTreeMap<String, u64> {
++    if samples.is_empty() {
++        return BTreeMap::new();
++    }
++
++    samples.sort_unstable();
++    let len = samples.len();
++
++    let percentiles = vec![
++        ("p10", 0.10),
++        ("p20", 0.20),
++        ("p30", 0.30),
++        ("p40", 0.40),
++        ("p50", 0.50),
++        ("p60", 0.60),
++        ("p70", 0.70),
++        ("p75", 0.75),
++        ("p80", 0.80),
++        ("p90", 0.90),
++        ("p95", 0.95),
++        ("p99", 0.99),
++        ("p99.9", 0.999),
++        ("p99.99", 0.9999),
++        ("p99.999", 0.99999),
++    ];
++
++    let mut result = BTreeMap::new();
++    for (label, ratio) in percentiles {
++        let index = ((len as f64) * ratio).ceil() as usize - 1;
++        let index = index.min(len - 1);
++        result.insert(label.to_string(), samples[index]);
++    }
++
++    result
++}
++
+ #[derive(Debug, Clone)]
+ struct GasMeasurement {
+     pub gas: f64,
+@@ -209,6 +247,9 @@ pub(crate) struct OverallMeasuring {
+ 
+ impl OverallMeasuring {
+     pub fn start() -> Self {
++        // Start a new latency measurement period.
++        block_executor_counters::reset_latency_collector();
++
+         Self {
+             start_time: Instant::now(),
+             start_execution: ExecutionTimeMeasurement::now(),
+@@ -216,7 +257,13 @@ impl OverallMeasuring {
+         }
+     }
+ 
+-    pub fn elapsed(self, prefix: String, metadata: String, num_txns: u64) -> OverallMeasurement {
++    pub fn elapsed(
++        self,
++        prefix: String,
++        metadata: String,
++        num_txns: u64,
++        num_blocks: u64,
++    ) -> OverallMeasurement {
+         let elapsed = self.start_time.elapsed().as_secs_f64();
+         let delta_execution = self.start_execution.elapsed_delta();
+         let delta_gas = self.start_gas.elapsed_delta();
+@@ -226,6 +273,7 @@ impl OverallMeasuring {
+             metadata,
+             elapsed,
+             num_txns,
++            num_blocks,
+             delta_execution,
+             delta_gas,
+         }
+@@ -238,11 +286,30 @@ pub struct OverallMeasurement {
+     metadata: String,
+     elapsed: f64,
+     num_txns: u64,
++    /// Number of blocks generated during the measurement (0 if not tracked).
++    num_blocks: u64,
+     delta_execution: ExecutionTimeMeasurement,
+     delta_gas: GasMeasurement,
+ }
+ 
+ impl OverallMeasurement {
++    pub fn get_num_blocks(&self) -> u64 {
++        self.num_blocks
++    }
++
++    pub fn get_blocks_per_second(&self) -> f64 {
++        self.num_blocks as f64 / self.elapsed
++    }
++
++    /// Elapsed time as HH:MM:SS.
++    pub fn get_elapsed_formatted(&self) -> String {
++        let total_secs = self.elapsed as u64;
++        let hours = total_secs / 3600;
++        let minutes = (total_secs % 3600) / 60;
++        let secs = total_secs % 60;
++        format!("{:02}:{:02}:{:02}", hours, minutes, secs)
++    }
++
+     pub fn get_tps(&self) -> f64 {
+         self.num_txns as f64 / self.elapsed
+     }
+@@ -417,6 +484,32 @@ impl OverallMeasurement {
+             self.delta_execution.commit_total_time / self.elapsed,
+             num_txns / self.delta_execution.commit_total_time
+         );
++
++        // Block generation rate and run time, parsed by testsuite/single_node_performance.py.
++        info!(
++            "{} Elapsed time: {}",
++            self.prefix,
++            self.get_elapsed_formatted()
++        );
++        info!("{} num_blocks: {}", self.prefix, self.get_num_blocks());
++        info!(
++            "{} blocks/s: {:.2}",
++            self.prefix,
++            self.get_blocks_per_second()
++        );
++
++        // Transaction execution latency percentiles, also parsed by the testsuite.
++        let mut all_latencies = block_executor_counters::get_all_latencies();
++        if !all_latencies.is_empty() {
++            let percentiles = calculate_percentiles_us(&mut all_latencies);
++            info!(
++                "{} === Transaction Tail Latencies (microseconds) ===\n",
++                self.prefix
++            );
++            for (label, value_us) in percentiles.iter() {
++                info!("{} {}: {} us\n", self.prefix, label, value_us);
++            }
++        }
+     }
+ 
+     pub fn format_end_table(stages: &[Self], overall: &Self) -> String {
+@@ -482,6 +575,8 @@ impl OverallMeasurement {
+         serde_json::json!({
+             "stage": self.prefix.replace("Staged execution: ", ""),
+             "metadata": self.metadata,
++            "num_blocks": self.get_num_blocks(),
++            "blocks/s": format!("{:.2}", self.get_blocks_per_second()),
+             "txns/s": format!("{:.2}", self.get_tps()),
+             "gas/s": format!("{:.2}", self.get_gps()),
+             "eff_gas/s": format!("{:.2}", self.get_effective_gps()),
+diff --git a/execution/executor-benchmark/src/pipeline.rs b/execution/executor-benchmark/src/pipeline.rs
+index a3fec9df39..8c58e8e840 100644
+--- a/execution/executor-benchmark/src/pipeline.rs
++++ b/execution/executor-benchmark/src/pipeline.rs
+@@ -231,6 +231,7 @@ where
+                                 format!("Staged execution: stage {}:", stage_index),
+                                 format!("{:?}", stage_txn_occurences),
+                                 stage_executed,
++                                0, /* num_blocks: not tracked per stage */
+                             );
+ 
+                             stage_measurement.print_end();
+@@ -249,6 +250,7 @@ where
+                         format!("Staged execution: stage {}:", stage_index),
+                         format!("{:?}", stage_txn_occurences),
+                         stage_executed,
++                        0, /* num_blocks: not tracked per stage */
+                     );
+                     stage_measurement.print_end();
+                     staged_result_clone.lock().push(stage_measurement);
+@@ -264,6 +266,7 @@ where
+                                 "across all stages".to_string()
+                             },
+                             executed,
++                            0, /* num_blocks: not tracked by the execution stage */
+                         )
+                         .print_end();
+                 }
+diff --git a/execution/executor-benchmark/src/transaction_generator.rs b/execution/executor-benchmark/src/transaction_generator.rs
+index 9de68baac4..a5b2084321 100644
+--- a/execution/executor-benchmark/src/transaction_generator.rs
++++ b/execution/executor-benchmark/src/transaction_generator.rs
+@@ -47,6 +47,7 @@ use std::{
+         atomic::{AtomicUsize, Ordering},
+         mpsc, Arc, Mutex,
+     },
++    time::{Duration, Instant},
+ };
+ use thread_local::ThreadLocal;
+ 
+@@ -182,6 +183,37 @@ struct P2pTestCase {
+     num_accounts: usize,
+ }
+ 
++/// End of block generation for time-based runs (BENCHMARK_DURATION_SECS).
++struct GenerationDeadline {
++    start_time: Instant,
++    duration_limit: Option<Duration>,
++}
++
++impl GenerationDeadline {
++    fn new(benchmark_duration_secs: Option<u64>) -> Self {
++        Self {
++            start_time: Instant::now(),
++            duration_limit: benchmark_duration_secs.map(Duration::from_secs),
++        }
++    }
++
++    /// Returns true (and logs it) once the time limit has passed, checked before
++    /// generating block number `num_generated`.
++    fn reached(&self, num_generated: usize) -> bool {
++        match self.duration_limit {
++            Some(limit) if self.start_time.elapsed() >= limit => {
++                info!(
++                    "Time limit reached: {} seconds, generated {} blocks",
++                    limit.as_secs(),
++                    num_generated
++                );
++                true
++            },
++            _ => false,
++        }
++    }
++}
++
+ pub struct TransactionGenerator {
+     /// The current state of the accounts. The main purpose is to keep track of the sequence number
+     /// so generated transactions are guaranteed to be successfully executed.
+@@ -395,6 +427,7 @@ impl TransactionGenerator {
+         &mut self,
+         block_size: usize,
+         num_transfer_blocks: usize,
++        benchmark_duration_secs: Option<u64>,
+         transactions_per_sender: usize,
+         connected_tx_grps: usize,
+         shuffle_connected_txns: bool,
+@@ -404,11 +437,14 @@ impl TransactionGenerator {
+         self.gen_transfer_transactions(
+             block_size,
+             num_transfer_blocks,
++            benchmark_duration_secs,
+             transactions_per_sender,
+             connected_tx_grps,
+             shuffle_connected_txns,
+             hotspot_probability,
+         );
++        // NOTE: if a time limit stops generation early, this still reports the
++        // requested number of blocks; see CoFDP KNOWN_ISSUES (BC-6).
+         num_transfer_blocks
+     }
+ 
+@@ -416,10 +452,13 @@ impl TransactionGenerator {
+         &mut self,
+         block_size: usize,
+         num_blocks: usize,
++        benchmark_duration_secs: Option<u64>,
+         transaction_generators: Vec<Box<dyn aptos_transaction_generator_lib::TransactionGenerator>>,
+         phase: Arc<AtomicUsize>,
+         transactions_per_sender: usize,
+     ) -> usize {
++        let deadline = GenerationDeadline::new(benchmark_duration_secs);
++
+         let last_non_empty_phase = Arc::new(AtomicUsize::new(0));
+         let transaction_generators = Mutex::new(transaction_generators);
+         assert!(self.block_sender.is_some());
+@@ -427,6 +466,10 @@ impl TransactionGenerator {
+         let account_pool_size = self.main_signer_accounts.as_ref().unwrap().accounts.len();
+         let transaction_generator = ThreadLocal::with_capacity(self.num_workers);
+         for i in 0..num_blocks {
++            if deadline.reached(i) {
++                return i;
++            }
++
+             let sender_indices = rand::seq::index::sample(
+                 &mut thread_rng(),
+                 account_pool_size,
+@@ -589,9 +632,16 @@ impl TransactionGenerator {
+         &mut self,
+         block_size: usize,
+         num_blocks: usize,
++        benchmark_duration_secs: Option<u64>,
+         transactions_per_sender: usize,
+     ) {
+-        for _ in 0..num_blocks {
++        let deadline = GenerationDeadline::new(benchmark_duration_secs);
++
++        for i in 0..num_blocks {
++            if deadline.reached(i) {
++                return;
++            }
++
+             let transfer_indices =
+                 self.get_random_transfer_indices(block_size, transactions_per_sender);
+             self.generate_and_send_transfer_block(
+@@ -633,10 +683,17 @@ impl TransactionGenerator {
+         &mut self,
+         block_size: usize,
+         num_blocks: usize,
++        benchmark_duration_secs: Option<u64>,
+         hotspot_probability: f32,
+     ) {
++        let deadline = GenerationDeadline::new(benchmark_duration_secs);
++
+         assert!((0.5..1.0).contains(&hotspot_probability));
+-        for _ in 0..num_blocks {
++        for i in 0..num_blocks {
++            if deadline.reached(i) {
++                return;
++            }
++
+             let transfer_indices =
+                 self.get_random_with_hotspot_transfer_indices(block_size, hotspot_probability);
+             self.generate_and_send_transfer_block(
+@@ -735,10 +792,17 @@ impl TransactionGenerator {
+         &mut self,
+         block_size: usize,
+         num_blocks: usize,
++        benchmark_duration_secs: Option<u64>,
+         connected_tx_grps: usize,
+         shuffle_connected_txns: bool,
+     ) {
+-        for _ in 0..num_blocks {
++        let deadline = GenerationDeadline::new(benchmark_duration_secs);
++
++        for i in 0..num_blocks {
++            if deadline.reached(i) {
++                return;
++            }
++
+             let num_signer_accounts = self.main_signer_accounts.as_ref().unwrap().accounts.len();
+             let rng = &mut self.main_signer_accounts.as_mut().unwrap().rng;
+             let transfer_indices: Vec<_> =
+@@ -864,6 +928,7 @@ impl TransactionGenerator {
+         &mut self,
+         block_size: usize,
+         num_blocks: usize,
++        benchmark_duration_secs: Option<u64>,
+         transactions_per_sender: usize,
+         connected_tx_grps: usize,
+         shuffle_connected_txns: bool,
+@@ -879,6 +944,7 @@ impl TransactionGenerator {
+             self.gen_connected_grps_transfer_transactions(
+                 block_size,
+                 num_blocks,
++                benchmark_duration_secs,
+                 connected_tx_grps,
+                 shuffle_connected_txns,
+             );
+@@ -888,12 +954,18 @@ impl TransactionGenerator {
+             self.gen_random_transfers_with_hotspot(
+                 block_size,
+                 num_blocks,
++                benchmark_duration_secs,
+                 hotspot_probability.unwrap(),
+             );
+         } else {
+             info!("block_generation_mode=default_sample");
+             info!("transactions_per_sender={transactions_per_sender}");
+-            self.gen_random_transfer_transactions(block_size, num_blocks, transactions_per_sender);
++            self.gen_random_transfer_transactions(
++                block_size,
++                num_blocks,
++                benchmark_duration_secs,
++                transactions_per_sender,
++            );
+         }
+     }
+ 

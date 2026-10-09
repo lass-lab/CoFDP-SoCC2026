@@ -1,0 +1,359 @@
+multinode-demo: add CoFDP launchers
+
+multinode-demo/cofdp/{setup,bootstrap-validator,bench-tps}.sh are the upstream
+scripts with the validator's ledger, accounts and snapshots placed in a
+P-Directory ($COFDP_TENANT_ROOT/$COFDP_PDIR, default /home/femu/tenant0/p1),
+and with the CoFDP defaults of bench-tps: --duration 1200 --tx-count 10000
+--threads 8. The upstream scripts are not modified.
+
+Base: solana-labs/solana tag v1.18.26
+      (commit d9f20e951a06b61e4505da0955228020b96a8915)
+Apply: git apply 0002-multinode-demo-cofdp-launchers.patch
+License: Apache-2.0, the license of Solana (see LICENSE)
+
+diff --git a/multinode-demo/cofdp/bench-tps.sh b/multinode-demo/cofdp/bench-tps.sh
+new file mode 100755
+index 000000000..e2c7a2d79
+--- /dev/null
++++ b/multinode-demo/cofdp/bench-tps.sh
+@@ -0,0 +1,38 @@
++#!/usr/bin/env bash
++#
++# CoFDP variant of multinode-demo/bench-tps.sh: identical, except for the
++# default run length and load (1200 s, --tx-count 10000, 8 sender threads).
++# Every default can be overridden on the command line, e.g. --duration 900.
++#
++set -e
++
++here=$(dirname "$0")
++# shellcheck source=multinode-demo/common.sh
++source "$here"/../common.sh
++
++usage() {
++  if [[ -n $1 ]]; then
++    echo "$*"
++    echo
++  fi
++  echo "usage: $0 [extra args]"
++  echo
++  echo " Run bench-tps "
++  echo
++  echo "   extra args: additional arguments are passed along to solana-bench-tps"
++  echo
++  exit 1
++}
++
++args=("$@")
++default_arg --url "http://127.0.0.1:8899"
++default_arg --entrypoint "127.0.0.1:8001"
++default_arg --faucet "127.0.0.1:9900"
++default_arg --duration 1200
++default_arg --tx-count 10000
++default_arg --thread-batch-sleep-ms 0
++default_arg --threads 8
++default_arg --bind-address "127.0.0.1"
++default_arg --client-node-id "${SOLANA_CONFIG_DIR}/bootstrap-validator/identity.json"
++
++$solana_bench_tps "${args[@]}"
+diff --git a/multinode-demo/cofdp/bootstrap-validator.sh b/multinode-demo/cofdp/bootstrap-validator.sh
+new file mode 100755
+index 000000000..84f007591
+--- /dev/null
++++ b/multinode-demo/cofdp/bootstrap-validator.sh
+@@ -0,0 +1,212 @@
++#!/usr/bin/env bash
++#
++# Start the bootstrap validator node
++#
++# CoFDP variant of multinode-demo/bootstrap-validator.sh: identical, except
++# that the ledger, the accounts and the snapshots live in the P-Directory
++# $COFDP_TENANT_ROOT/$COFDP_PDIR (default: /home/femu/tenant0/p1). PiDir-Binding
++# can then bind other P-Directories onto subdirectories of it (accounts/,
++# rocksdb/, snapshot/, ...) so that each kind of validator data is written
++# with its own PID.
++#
++set -e
++
++here=$(dirname "$0")
++# shellcheck source=multinode-demo/common.sh
++source "$here"/../common.sh
++
++: "${COFDP_TENANT_ROOT:=/home/femu/tenant0}"
++: "${COFDP_PDIR:=p1}"
++
++if [[ "$SOLANA_GPU_MISSING" -eq 1 ]]; then
++  echo "Testnet requires GPUs, but none were found!  Aborting..."
++  exit 1
++fi
++
++if [[ -n $SOLANA_CUDA ]]; then
++  program=$solana_validator_cuda
++else
++  program=$solana_validator
++fi
++
++no_restart=0
++maybeRequireTower=true
++
++args=()
++while [[ -n $1 ]]; do
++  if [[ ${1:0:1} = - ]]; then
++    if [[ $1 = --init-complete-file ]]; then
++      args+=("$1" "$2")
++      shift 2
++    elif [[ $1 = --gossip-host ]]; then
++      args+=("$1" "$2")
++      shift 2
++    elif [[ $1 = --gossip-port ]]; then
++      args+=("$1" "$2")
++      shift 2
++    elif [[ $1 = --dev-halt-at-slot ]]; then
++      args+=("$1" "$2")
++      shift 2
++    elif [[ $1 = --dynamic-port-range ]]; then
++      args+=("$1" "$2")
++      shift 2
++    elif [[ $1 = --limit-ledger-size ]]; then
++      args+=("$1" "$2")
++      shift 2
++    elif [[ $1 = --no-rocksdb-compaction ]]; then
++      args+=("$1")
++      shift
++    elif [[ $1 = --enable-rpc-transaction-history ]]; then
++      args+=("$1")
++      shift
++    elif [[ $1 = --rpc-pubsub-enable-block-subscription ]]; then
++      args+=("$1")
++      shift
++    elif [[ $1 = --enable-cpi-and-log-storage ]]; then
++      args+=("$1")
++      shift
++    elif [[ $1 = --enable-extended-tx-metadata-storage ]]; then
++      args+=("$1")
++      shift
++    elif [[ $1 = --enable-rpc-bigtable-ledger-storage ]]; then
++      args+=("$1")
++      shift
++    elif [[ $1 = --tpu-disable-quic ]]; then
++      args+=("$1")
++      shift
++    elif [[ $1 = --tpu-enable-udp ]]; then
++      args+=("$1")
++      shift
++    elif [[ $1 = --rpc-send-batch-ms ]]; then
++      args+=("$1" "$2")
++      shift 2
++    elif [[ $1 = --rpc-send-batch-size ]]; then
++      args+=("$1" "$2")
++      shift 2
++    elif [[ $1 = --skip-poh-verify ]]; then
++      args+=("$1")
++      shift
++    elif [[ $1 = --log ]]; then
++      args+=("$1" "$2")
++      shift 2
++    elif [[ $1 = --no-restart ]]; then
++      no_restart=1
++      shift
++    elif [[ $1 == --wait-for-supermajority ]]; then
++      args+=("$1" "$2")
++      shift 2
++    elif [[ $1 == --expected-bank-hash ]]; then
++      args+=("$1" "$2")
++      shift 2
++    elif [[ $1 == --accounts ]]; then
++      args+=("$1" "$2")
++      shift 2
++    elif [[ $1 == --maximum-snapshots-to-retain ]]; then
++      args+=("$1" "$2")
++      shift 2
++    elif [[ $1 == --no-snapshot-fetch ]]; then
++      args+=("$1")
++      shift
++    elif [[ $1 == --accounts-db-skip-shrink ]]; then
++      args+=("$1")
++      shift
++    elif [[ $1 == --skip-require-tower ]]; then
++      maybeRequireTower=false
++      shift
++    elif [[ $1 = --log-messages-bytes-limit ]]; then
++      args+=("$1" "$2")
++      shift 2
++    elif [[ $1 == --block-production-method ]]; then
++      args+=("$1" "$2")
++      shift 2
++    else
++      echo "Unknown argument: $1"
++      $program --help
++      exit 1
++    fi
++  else
++    echo "Unknown argument: $1"
++    $program --help
++    exit 1
++  fi
++done
++
++# These keypairs are created by ./setup.sh and included in the genesis config
++identity=$SOLANA_CONFIG_DIR/bootstrap-validator/identity.json
++vote_account="$SOLANA_CONFIG_DIR"/bootstrap-validator/vote-account.json
++
++ledger_dir="$COFDP_TENANT_ROOT/$COFDP_PDIR/"
++accounts_dir="$COFDP_TENANT_ROOT/$COFDP_PDIR/accounts"
++snapshots_dir="$COFDP_TENANT_ROOT/$COFDP_PDIR/"
++[[ -d "$ledger_dir" ]] || {
++  echo "$ledger_dir does not exist"
++  echo
++  echo "Please run: $here/setup.sh"
++  exit 1
++}
++
++if [[ $maybeRequireTower = true ]]; then
++  args+=(--require-tower)
++fi
++
++args+=(
++  --ledger "$ledger_dir"
++  --accounts "$accounts_dir"
++  --snapshots "$snapshots_dir"
++  --rpc-port 8899
++  --snapshot-interval-slots 200
++  --no-incremental-snapshots
++  --identity "$identity"
++  --vote-account "$vote_account"
++  --rpc-faucet-address 127.0.0.1:9900
++  --no-poh-speed-test
++  --no-os-network-limits-test
++  --no-wait-for-vote-to-start-leader
++  --full-rpc-api
++  --allow-private-addr
++)
++default_arg --gossip-port 8001
++default_arg --log -
++
++
++pid=
++kill_node() {
++  # Note: do not echo anything from this function to ensure $pid is actually
++  # killed when stdout/stderr are redirected
++  set +ex
++  if [[ -n $pid ]]; then
++    declare _pid=$pid
++    pid=
++    kill "$_pid" || true
++    wait "$_pid" || true
++  fi
++}
++
++kill_node_and_exit() {
++  kill_node
++  exit
++}
++
++trap 'kill_node_and_exit' INT TERM ERR
++
++while true; do
++  echo "$program ${args[*]}"
++  $program "${args[@]}" &
++  pid=$!
++  echo "pid: $pid"
++
++  if ((no_restart)); then
++    wait "$pid"
++    exit $?
++  fi
++
++  while true; do
++    if [[ -z $pid ]] || ! kill -0 "$pid"; then
++      echo "############## validator exited, restarting ##############"
++      break
++    fi
++    sleep 1
++  done
++
++  kill_node
++done
+diff --git a/multinode-demo/cofdp/setup.sh b/multinode-demo/cofdp/setup.sh
+new file mode 100755
+index 000000000..b1c30e879
+--- /dev/null
++++ b/multinode-demo/cofdp/setup.sh
+@@ -0,0 +1,78 @@
++#!/usr/bin/env bash
++#
++# CoFDP variant of multinode-demo/setup.sh: identical, except that the genesis
++# ledger of the bootstrap validator is created inside a P-Directory instead of
++# under $SOLANA_CONFIG_DIR, so that all validator data lands on the PiDir-FS
++# volume.
++#
++#   COFDP_TENANT_ROOT     directory holding the bind-mounted P-Directories
++#                         (default: /home/femu/tenant0)
++#   COFDP_PDIR            P-Directory used as the validator ledger (default: p1)
++#   COFDP_SOLANA_WAL_DIR  optional: write-ahead log directory of the blockstore
++#                         (default: the ledger's rocksdb/), read by
++#                         solana-genesis and solana-validator; it must be empty
++#                         when this script runs
++#
++# Use the same values for cofdp/bootstrap-validator.sh.
++#
++
++here=$(dirname "$0")
++# shellcheck source=multinode-demo/common.sh
++source "$here"/../common.sh
++
++set -e
++
++: "${COFDP_TENANT_ROOT:=/home/femu/tenant0}"
++: "${COFDP_PDIR:=p1}"
++ledger_dir="$COFDP_TENANT_ROOT/$COFDP_PDIR/"
++
++rm -rf "$SOLANA_CONFIG_DIR"/bootstrap-validator
++mkdir -p "$SOLANA_CONFIG_DIR"/bootstrap-validator
++
++# Create genesis ledger
++if [[ -r $FAUCET_KEYPAIR ]]; then
++  cp -f "$FAUCET_KEYPAIR" "$SOLANA_CONFIG_DIR"/faucet.json
++else
++  $solana_keygen new --no-passphrase -fso "$SOLANA_CONFIG_DIR"/faucet.json
++fi
++
++if [[ -f $BOOTSTRAP_VALIDATOR_IDENTITY_KEYPAIR ]]; then
++  cp -f "$BOOTSTRAP_VALIDATOR_IDENTITY_KEYPAIR" "$SOLANA_CONFIG_DIR"/bootstrap-validator/identity.json
++else
++  $solana_keygen new --no-passphrase -so "$SOLANA_CONFIG_DIR"/bootstrap-validator/identity.json
++fi
++if [[ -f $BOOTSTRAP_VALIDATOR_STAKE_KEYPAIR ]]; then
++  cp -f "$BOOTSTRAP_VALIDATOR_STAKE_KEYPAIR" "$SOLANA_CONFIG_DIR"/bootstrap-validator/stake-account.json
++else
++  $solana_keygen new --no-passphrase -so "$SOLANA_CONFIG_DIR"/bootstrap-validator/stake-account.json
++fi
++if [[ -f $BOOTSTRAP_VALIDATOR_VOTE_KEYPAIR ]]; then
++  cp -f "$BOOTSTRAP_VALIDATOR_VOTE_KEYPAIR" "$SOLANA_CONFIG_DIR"/bootstrap-validator/vote-account.json
++else
++  $solana_keygen new --no-passphrase -so "$SOLANA_CONFIG_DIR"/bootstrap-validator/vote-account.json
++fi
++
++args=(
++  "$@"
++  --max-genesis-archive-unpacked-size 1073741824
++  --enable-warmup-epochs
++  --ledger "$ledger_dir"
++  --bootstrap-validator "$SOLANA_CONFIG_DIR"/bootstrap-validator/identity.json
++                        "$SOLANA_CONFIG_DIR"/bootstrap-validator/vote-account.json
++                        "$SOLANA_CONFIG_DIR"/bootstrap-validator/stake-account.json
++)
++
++"$SOLANA_ROOT"/fetch-spl.sh
++if [[ -r spl-genesis-args.sh ]]; then
++  SPL_GENESIS_ARGS=$(cat "$SOLANA_ROOT"/spl-genesis-args.sh)
++  #shellcheck disable=SC2207
++  #shellcheck disable=SC2206
++  args+=($SPL_GENESIS_ARGS)
++fi
++
++default_arg --faucet-pubkey "$SOLANA_CONFIG_DIR"/faucet.json
++default_arg --faucet-lamports 500000000000000000
++default_arg --hashes-per-tick auto
++default_arg --cluster-type development
++
++$solana_genesis "${args[@]}"

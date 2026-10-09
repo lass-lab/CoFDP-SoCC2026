@@ -1,0 +1,40 @@
+ledger: optional write-ahead log directory for the blockstore
+
+If the environment variable COFDP_SOLANA_WAL_DIR is set and not empty, the
+blockstore keeps the write-ahead log (WAL) of its RocksDB in that directory
+instead of in the RocksDB directory (<ledger>/rocksdb). With PiDir-Binding the
+directory can be a P-Directory of its own, so that the WAL is written with its
+own PID. Unset or empty: upstream behaviour.
+
+Every process that opens the blockstore (solana-genesis, solana-validator,
+solana-ledger-tool) reads the variable; give them all the same value. RocksDB
+creates the directory if its parent exists, and does not create a new
+blockstore while the directory holds WAL files of another one, so the
+directory must be empty when the ledger is created.
+
+Base: solana-labs/solana tag v1.18.26
+      (commit d9f20e951a06b61e4505da0955228020b96a8915)
+Apply: git apply 0003-ledger-optional-blockstore-wal-directory.patch
+License: Apache-2.0, the license of Solana (see LICENSE)
+
+diff --git a/ledger/src/blockstore_db.rs b/ledger/src/blockstore_db.rs
+index db11eefbb..2ee248253 100644
+--- a/ledger/src/blockstore_db.rs
++++ b/ledger/src/blockstore_db.rs
+@@ -2177,6 +2177,16 @@ fn get_db_options(access_type: &AccessType) -> Options {
+     // See https://github.com/facebook/rocksdb/wiki/Secondary-instance
+     options.set_max_open_files(-1);
+ 
++    // CoFDP: COFDP_SOLANA_WAL_DIR moves the write-ahead log out of the RocksDB
++    // directory, e.g. into a P-Directory of its own so that the WAL is written
++    // with its own PID. Every process that opens the blockstore must see the
++    // same value. Unset or empty: the WAL stays in the RocksDB directory.
++    let wal_dir = std::env::var_os("COFDP_SOLANA_WAL_DIR").unwrap_or_default();
++    if !wal_dir.is_empty() {
++        info!("Blockstore WAL directory: {wal_dir:?} (COFDP_SOLANA_WAL_DIR)");
++        options.set_wal_dir(wal_dir);
++    }
++
+     options
+ }
+ 

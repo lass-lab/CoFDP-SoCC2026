@@ -1,0 +1,338 @@
+testsuite: CoFDP runner for the single-node executor benchmark
+
+* testsuite/performance_benchmark_cofdp.sh --cofdp (300 blocks of
+  apt-fa-transfer, FLOW=MAINNET) and --cofdp-time (apt-fa-transfer-sj,
+  block generation stops after 530 s, FLOW=ADHOC).
+* single_node_performance.py: FLOW=MAINNET/ADHOC are reduced to these two
+  tests; the DB is created under $COFDP_APTOS_DIR (set by the runner, default
+  /home/femu/tenant0/p1); the time-based mode; parsing and reporting of the
+  block count, run time and latency percentiles.
+* Calibration row for apt-fa-transfer-sj.
+
+Base: aptos-labs/aptos-core main at commit
+      2f99b2fbeb63ee3ee4d8fbdbd1aba164e39ed7b8 (2025-12-29)
+Apply: git apply 0002-testsuite-cofdp-runner.patch
+License: this patch modifies aptos-core and is subject to aptos-core's
+         Innovation-Enabling Source Code License (see LICENSE and README.md);
+         the testsuite/ scripts keep their upstream Apache-2.0 headers.
+
+diff --git a/testsuite/performance_benchmark_cofdp.sh b/testsuite/performance_benchmark_cofdp.sh
+new file mode 100755
+index 0000000000..6334191d1e
+--- /dev/null
++++ b/testsuite/performance_benchmark_cofdp.sh
+@@ -0,0 +1,66 @@
++#!/bin/bash
++# Copyright © Aptos Foundation
++# SPDX-License-Identifier: Apache-2.0
++
++# CoFDP variant of performance_benchmark.sh.
++#
++#   --cofdp       apt-fa-transfer, 300 blocks per test (FLOW=MAINNET)
++#   --cofdp-time  apt-fa-transfer-sj: apt-fa-transfer whose block generation stops
++#                 after 530 s (FLOW=ADHOC)
++#
++# The benchmark DB (db/) and its checkpoint (cp/) are created under $COFDP_APTOS_DIR
++# (default: /home/femu/tenant0/p1), the directory tree prepared by PiDir-Binding.
++
++# Set the maximum number of file descriptors
++ulimit -n 1048576
++
++export COFDP_APTOS_DIR="${COFDP_APTOS_DIR:-/home/femu/tenant0/p1}"
++
++# Function to run the benchmark
++run_benchmark() {
++    FLOW=$1\
++    NUM_BLOCKS_PER_TEST=$2\
++    HIDE_OUTPUT=$3\
++    ENABLE_PRUNER=$4\
++    NUMBER_OF_EXECUTION_THREADS=$5\
++    SKIP_MOVE_E2E=1\
++    ./testsuite/single_node_performance.py
++}
++
++# Time-based variant: a non-zero BENCHMARK_DURATION_SECS selects the time-based
++# account sizing; the per-test duration (530 s) is set in single_node_performance.py.
++run_benchmark_time_based() {
++    FLOW=$1\
++    NUM_BLOCKS_PER_TEST=$2\
++    BENCHMARK_DURATION_SECS=$3\
++    HIDE_OUTPUT=$4\
++    ENABLE_PRUNER=$5\
++    NUMBER_OF_EXECUTION_THREADS=$6\
++    SKIP_MOVE_E2E=1\
++    ./testsuite/single_node_performance.py
++}
++
++VIRTUAL_CORES=$(getconf _NPROCESSORS_ONLN)
++
++# Both modes use 8 execution threads, whatever the number of cores.
++THREADS=8
++
++echo "Using NUMBER_OF_EXECUTION_THREADS = $THREADS (found $VIRTUAL_CORES virtual cores)"
++
++NBPT=300
++# NOTE: single_node_performance.py treats any non-empty HIDE_OUTPUT as set, so
++# HD=0 still hides the benchmark output; see CoFDP KNOWN_ISSUES (BC-11).
++HD=0
++EP=1
++
++# Check for the flag
++if [ "$1" == "--cofdp" ]; then
++    echo "Running CoFDP benchmark..."
++    run_benchmark "MAINNET" $NBPT $HD $EP $THREADS
++elif [ "$1" == "--cofdp-time" ]; then
++    echo "Running time-based apt-fa-transfer-sj benchmark (block generation stops after 530 seconds)"
++    run_benchmark_time_based "ADHOC" 1000000 1200 $HD $EP $THREADS
++else
++    echo "Usage: $0 [--cofdp | --cofdp-time]"
++    exit 1
++fi
+diff --git a/testsuite/single_node_performance.py b/testsuite/single_node_performance.py
+index e7e7f19538..9b5d7dde11 100755
+--- a/testsuite/single_node_performance.py
++++ b/testsuite/single_node_performance.py
+@@ -62,10 +62,15 @@ DEFAULT_MAX_BLOCK_SIZE = "10000"
+ MAX_BLOCK_SIZE = int(os.environ.get("MAX_BLOCK_SIZE", default=DEFAULT_MAX_BLOCK_SIZE))
+ NUM_BLOCKS = int(os.environ.get("NUM_BLOCKS_PER_TEST", default=30))
+ NUM_BLOCKS_DETAILED = 10
++# CoFDP time-based runs (performance_benchmark_cofdp.sh --cofdp-time): a non-zero value
++# only switches the account sizing, because NUM_BLOCKS is then just an upper bound; the
++# account pools are sized for 300 blocks instead.
++BENCHMARK_DURATION_SECS = int(os.environ.get("BENCHMARK_DURATION_SECS", default=0))
++BLOCKS_FOR_ACCOUNT_CALC = NUM_BLOCKS if BENCHMARK_DURATION_SECS == 0 else 300
+ NUM_ACCOUNTS = max(
+     [
+         int(os.environ.get("NUM_INIT_ACCOUNTS", default=DEFAULT_NUM_INIT_ACCOUNTS)),
+-        (2 + 2 * NUM_BLOCKS) * MAX_BLOCK_SIZE,
++        (2 + 2 * BLOCKS_FOR_ACCOUNT_CALC) * MAX_BLOCK_SIZE,
+     ]
+ )
+ MAIN_SIGNER_ACCOUNTS = 2 * MAX_BLOCK_SIZE
+@@ -186,14 +191,18 @@ DEFAULT_MODULE_WORKING_SET_SIZE = 100
+ TESTS = [
+     RunGroupConfig(key=RunGroupKey("no-op"), included_in=LAND_BLOCKING_AND_C),
+     RunGroupConfig(key=RunGroupKey("no-op", module_working_set_size=1000), included_in=LAND_BLOCKING_AND_C),
++    # CoFDP: FLOW=MAINNET runs only apt-fa-transfer and FLOW=ADHOC only its time-based variant
++    # apt-fa-transfer-sj (see performance_benchmark_cofdp.sh), so no other test is part of these
++    # two flows. The test_index of both tests (2 and 3) is reported in the JSON output.
+     RunGroupConfig(key=RunGroupKey("apt-fa-transfer"), included_in=LAND_BLOCKING_AND_C | Flow.REPRESENTATIVE | Flow.MAINNET),
++    RunGroupConfig(key=RunGroupKey("apt-fa-transfer-sj"), included_in=Flow.ADHOC),
+     RunGroupConfig(key=RunGroupKey("apt-fa-transfer", executor_type="NativeVM"), included_in=Flow.CONTINUOUS),
+-    RunGroupConfig(key=RunGroupKey("account-generation"), included_in=LAND_BLOCKING_AND_C | Flow.REPRESENTATIVE | Flow.MAINNET),
++    RunGroupConfig(key=RunGroupKey("account-generation"), included_in=LAND_BLOCKING_AND_C | Flow.REPRESENTATIVE),
+     RunGroupConfig(key=RunGroupKey("account-generation", executor_type="NativeVM"), included_in=Flow.CONTINUOUS),
+     RunGroupConfig(key=RunGroupKey("account-resource32-b"), included_in=Flow.CONTINUOUS),
+     RunGroupConfig(key=RunGroupKey("modify-global-resource"), included_in=LAND_BLOCKING_AND_C | Flow.REPRESENTATIVE),
+     RunGroupConfig(key=RunGroupKey("modify-global-resource", module_working_set_size=DEFAULT_MODULE_WORKING_SET_SIZE), included_in=Flow.CONTINUOUS),
+-    RunGroupConfig(key=RunGroupKey("publish-package"), included_in=LAND_BLOCKING_AND_C | Flow.REPRESENTATIVE | Flow.MAINNET),
++    RunGroupConfig(key=RunGroupKey("publish-package"), included_in=LAND_BLOCKING_AND_C | Flow.REPRESENTATIVE),
+     RunGroupConfig(key=RunGroupKey("mix_publish_transfer"), key_extra=RunGroupKeyExtra(
+         transaction_type_override="publish-package apt-fa-transfer",
+         transaction_weights_override="1 100",
+@@ -224,7 +233,7 @@ TESTS = [
+     RunGroupConfig(expected_tps=8000, key=RunGroupKey("resource-groups-global-write-and-read-tag1-kb", module_working_set_size=DEFAULT_MODULE_WORKING_SET_SIZE), included_in=Flow.RESOURCE_GROUPS, waived=True),
+     RunGroupConfig(key=RunGroupKey("resource-groups-sender-write-tag1-kb"), included_in=Flow.CONTINUOUS | Flow.RESOURCE_GROUPS),
+     RunGroupConfig(expected_tps=8000, key=RunGroupKey("resource-groups-sender-write-tag1-kb", module_working_set_size=DEFAULT_MODULE_WORKING_SET_SIZE), included_in=Flow.RESOURCE_GROUPS, waived=True),
+-    RunGroupConfig(key=RunGroupKey("resource-groups-sender-multi-change1-kb"), included_in=LAND_BLOCKING_AND_C | Flow.RESOURCE_GROUPS | Flow.ADHOC),
++    RunGroupConfig(key=RunGroupKey("resource-groups-sender-multi-change1-kb"), included_in=LAND_BLOCKING_AND_C | Flow.RESOURCE_GROUPS),
+     RunGroupConfig(expected_tps=8000, key=RunGroupKey("resource-groups-sender-multi-change1-kb", module_working_set_size=DEFAULT_MODULE_WORKING_SET_SIZE), included_in=Flow.RESOURCE_GROUPS, waived=True),
+ 
+     RunGroupConfig(key=RunGroupKey("token-v1ft-mint-and-transfer"), included_in=Flow.CONTINUOUS),
+@@ -245,7 +254,7 @@ TESTS = [
+ 
+     RunGroupConfig(key=RunGroupKey("no-op5-signers"), included_in=Flow.CONTINUOUS),
+ 
+-    RunGroupConfig(key=RunGroupKey("token-v2-ambassador-mint"), included_in=LAND_BLOCKING_AND_C | Flow.REPRESENTATIVE | Flow.MAINNET),
++    RunGroupConfig(key=RunGroupKey("token-v2-ambassador-mint"), included_in=LAND_BLOCKING_AND_C | Flow.REPRESENTATIVE),
+     RunGroupConfig(key=RunGroupKey("token-v2-ambassador-mint", module_working_set_size=DEFAULT_MODULE_WORKING_SET_SIZE), included_in=Flow.CONTINUOUS),
+ 
+     RunGroupConfig(key=RunGroupKey("liquidity-pool-swap"), included_in=LAND_BLOCKING_AND_C | Flow.REPRESENTATIVE),
+@@ -287,8 +296,8 @@ TESTS = [
+     RunGroupConfig(expected_tps=15000, key=RunGroupKey("account-generation"), included_in=Flow.MAINNET_LARGE_DB),
+     RunGroupConfig(expected_tps=60, key=RunGroupKey("publish-package"), included_in=Flow.MAINNET_LARGE_DB),
+     RunGroupConfig(expected_tps=6800, key=RunGroupKey("token-v2-ambassador-mint"), included_in=Flow.MAINNET_LARGE_DB),
+-    RunGroupConfig(expected_tps=17000 if NUM_ACCOUNTS < 5000000 else 28000, key=RunGroupKey("coin_transfer_connected_components", executor_type="sharded"), key_extra=RunGroupKeyExtra(sharding_traffic_flags="--connected-tx-grps 5000", transaction_type_override=""), included_in=Flow.MAINNET | Flow.MAINNET_LARGE_DB, waived=True),
+-    RunGroupConfig(expected_tps=27000 if NUM_ACCOUNTS < 5000000 else 23000, key=RunGroupKey("coin_transfer_hotspot", executor_type="sharded"), key_extra=RunGroupKeyExtra(sharding_traffic_flags="--hotspot-probability 0.8", transaction_type_override=""), included_in=Flow.MAINNET | Flow.MAINNET_LARGE_DB, waived=True),
++    RunGroupConfig(expected_tps=17000 if NUM_ACCOUNTS < 5000000 else 28000, key=RunGroupKey("coin_transfer_connected_components", executor_type="sharded"), key_extra=RunGroupKeyExtra(sharding_traffic_flags="--connected-tx-grps 5000", transaction_type_override=""), included_in=Flow.MAINNET_LARGE_DB, waived=True),
++    RunGroupConfig(expected_tps=27000 if NUM_ACCOUNTS < 5000000 else 23000, key=RunGroupKey("coin_transfer_hotspot", executor_type="sharded"), key_extra=RunGroupKeyExtra(sharding_traffic_flags="--hotspot-probability 0.8", transaction_type_override=""), included_in=Flow.MAINNET_LARGE_DB, waived=True),
+ ] + [
+     # no-commit throughput of different executor, used on continuous flow
+     RunGroupConfig(
+@@ -393,6 +402,15 @@ def execute_command(command):
+     return full_result
+ 
+ 
++# Transaction execution latency percentiles printed by aptos-executor-benchmark
++# as "<prefix> <label>: <value> us", in output order.
++LATENCY_PERCENTILES = ["p10", "p20", "p30", "p40", "p50", "p60", "p70", "p75", "p80", "p90", "p95", "p99", "p99.9", "p99.99", "p99.999"]
++
++
++def latency_json_key(label: str) -> str:
++    return label.replace(".", "_") + "_latency_us"
++
++
+ @dataclass
+ class RunResults:
+     tps: float
+@@ -409,6 +427,11 @@ class RunResults:
+     fraction_of_execution_in_inner_block_executor: float
+     fraction_in_ledger_update: float
+     fraction_in_commit: float
++    # CoFDP measurements, 0 when missing from the benchmark output
++    latency_us: Mapping[str, float] = field(default_factory=dict)  # by LATENCY_PERCENTILES label
++    num_blocks: int = 0
++    blocks_per_second: float = 0.0
++    elapsed_time_secs: float = 0.0
+ 
+ 
+ @dataclass
+@@ -525,6 +548,33 @@ def extract_run_results(
+             ]
+         )
+ 
++    # CoFDP measurements: latency percentiles, block count and run time.
++    latency_us = {label: 0.0 for label in LATENCY_PERCENTILES}
++    num_blocks = 0
++    blocks_per_second = 0.0
++    elapsed_time_secs = 0.0
++    try:
++        for label in LATENCY_PERCENTILES:
++            matches = re.findall(prefix + " " + re.escape(label) + r": (\d+\.?\d*) us", output)
++            if matches:
++                latency_us[label] = float(matches[-1])
++
++        num_blocks_match = re.findall(prefix + r" num_blocks: (\d+)", output)
++        if num_blocks_match:
++            num_blocks = int(num_blocks_match[-1])
++
++        blocks_per_second_match = re.findall(prefix + r" blocks/s: (\d+\.?\d*)", output)
++        if blocks_per_second_match:
++            blocks_per_second = float(blocks_per_second_match[-1])
++
++        # printed as HH:MM:SS
++        elapsed_time_match = re.findall(prefix + r" Elapsed time: (\d+):(\d+):(\d+)", output)
++        if elapsed_time_match:
++            hours, minutes, seconds = map(int, elapsed_time_match[-1])
++            elapsed_time_secs = hours * 3600 + minutes * 60 + seconds
++    except Exception as e:
++        print(f"Warning: Failed to parse tail latencies: {e}")
++
+     return RunResults(
+         tps=tps,
+         gps=gps,
+@@ -540,6 +590,10 @@ def extract_run_results(
+         fraction_of_execution_in_inner_block_executor=fraction_of_execution_in_inner_block_executor,
+         fraction_in_ledger_update=fraction_in_ledger_update,
+         fraction_in_commit=fraction_in_commit,
++        latency_us=latency_us,
++        num_blocks=num_blocks,
++        blocks_per_second=blocks_per_second,
++        elapsed_time_secs=elapsed_time_secs,
+     )
+ 
+ 
+@@ -589,6 +643,7 @@ def print_table(
+                 "out B/s",
+             ]
+         )
++        headers.extend([f"{label} us" for label in LATENCY_PERCENTILES])
+ 
+     rows = []
+     for result in results:
+@@ -634,6 +689,8 @@ def print_table(
+             row.append(int(round(result.single_node_result.gpt)))
+             row.append(int(round(result.single_node_result.storage_fee_pt)))
+             row.append(int(round(result.single_node_result.output_bps)))
++            for label in LATENCY_PERCENTILES:
++                row.append(int(round(result.single_node_result.latency_us.get(label, 0))))
+         rows.append(row)
+ 
+     print(tabulate(rows, headers=headers))
+@@ -643,6 +700,9 @@ errors = []
+ warnings = []
+ 
+ with tempfile.TemporaryDirectory() as tmpdirname:
++    # CoFDP: keep the benchmark DB (db/) and its checkpoint (cp/) in the directory tree
++    # prepared by PiDir-Binding (set by performance_benchmark_cofdp.sh).
++    tmpdirname = os.environ.get("COFDP_APTOS_DIR", tmpdirname)
+     move_e2e_benchmark_failed = False
+     if not SKIP_MOVE_E2E:
+         execute_command(f"cargo build {BUILD_FLAG} --package aptos-move-e2e-benchmark")
+@@ -746,12 +806,19 @@ with tempfile.TemporaryDirectory() as tmpdirname:
+                 4, int(min([criteria.expected_tps / 4, MAX_BLOCK_SIZE]))
+             )
+ 
++        # CoFDP time-based test: apt-fa-transfer, block generation stops after 530 s.
++        # NOTE: fixed; the runner's BENCHMARK_DURATION_SECS does not change it, see CoFDP
++        # KNOWN_ISSUES (BC-5).
++        is_time_based = test.key.transaction_type == "apt-fa-transfer-sj"
++        benchmark_duration = 530 if is_time_based else 0
++        duration_env = f"BENCHMARK_DURATION_SECS={benchmark_duration}" if benchmark_duration > 0 else ""
++
+         print(f"Testing {test.key}")
+         if test.key_extra.transaction_type_override == "":
+             workload_args_str = ""
+         else:
+-            transaction_type_list = (
+-                test.key_extra.transaction_type_override or test.key.transaction_type
++            transaction_type_list = test.key_extra.transaction_type_override or (
++                "apt-fa-transfer" if is_time_based else test.key.transaction_type
+             )
+             transaction_weights_list = (
+                 test.key_extra.transaction_weights_override or "1"
+@@ -813,21 +880,25 @@ with tempfile.TemporaryDirectory() as tmpdirname:
+         if test.key_extra.single_block_dst_working_set:
+             additional_dst_pool_accounts = MAX_BLOCK_SIZE
+         else:
+-            additional_dst_pool_accounts = 2 * MAX_BLOCK_SIZE * NUM_BLOCKS
++            # in time-based mode NUM_BLOCKS is only an upper bound, see BLOCKS_FOR_ACCOUNT_CALC
++            accounts_multiplier = BLOCKS_FOR_ACCOUNT_CALC if BENCHMARK_DURATION_SECS > 0 else NUM_BLOCKS
++            additional_dst_pool_accounts = 2 * MAX_BLOCK_SIZE * accounts_multiplier
+ 
+         common_command_suffix = f"{executor_type_str} {pipeline_extra_args_str} --block-size {cur_block_size} {DB_CONFIG_FLAGS} {DB_PRUNER_FLAGS} run-executor {FEATURE_FLAGS} {workload_args_str} --module-working-set-size {test.key.module_working_set_size} --main-signer-accounts {MAIN_SIGNER_ACCOUNTS} --additional-dst-pool-accounts {additional_dst_pool_accounts} --data-dir {tmpdirname}/db  --checkpoint-dir {tmpdirname}/cp"
+ 
+         number_of_threads_results = {}
+ 
+         for execution_threads in EXECUTION_ONLY_NUMBER_OF_THREADS:
+-            test_db_command = f"RUST_BACKTRACE=1 {BUILD_FOLDER}/aptos-executor-benchmark --execution-threads {execution_threads} --skip-commit {common_command_suffix} --blocks {NUM_BLOCKS_DETAILED}"
++            test_db_command = f"{duration_env} RUST_BACKTRACE=1 {BUILD_FOLDER}/aptos-executor-benchmark --execution-threads {execution_threads} --skip-commit {common_command_suffix} --blocks {NUM_BLOCKS_DETAILED}"
+             output = execute_command(test_db_command)
+ 
+             number_of_threads_results[execution_threads] = extract_run_results(
+                 output, "Overall execution"
+             )
+ 
+-        test_db_command = f"RUST_BACKTRACE=1 {BUILD_FOLDER}/aptos-executor-benchmark --execution-threads {number_of_execution_threads} {common_command_suffix} --blocks {NUM_BLOCKS}"
++        # time-based runs end through the duration limit, long before 1000000 blocks
++        actual_num_blocks = 1000000 if is_time_based else NUM_BLOCKS
++        test_db_command = f"{duration_env} RUST_BACKTRACE=1 {BUILD_FOLDER}/aptos-executor-benchmark --execution-threads {number_of_execution_threads} {common_command_suffix} --blocks {actual_num_blocks}"
+         output = execute_command(test_db_command)
+ 
+         single_node_result = extract_run_results(output, "Overall")
+@@ -892,6 +963,13 @@ with tempfile.TemporaryDirectory() as tmpdirname:
+                     "fraction_of_execution_in_inner_block_executor": single_node_result.fraction_of_execution_in_inner_block_executor,
+                     "fraction_in_ledger_update": single_node_result.fraction_in_ledger_update,
+                     "fraction_in_commit": single_node_result.fraction_in_commit,
++                    **{
++                        latency_json_key(label): single_node_result.latency_us[label]
++                        for label in LATENCY_PERCENTILES
++                    },
++                    "num_blocks": single_node_result.num_blocks,
++                    "blocks_per_second": single_node_result.blocks_per_second,
++                    "elapsed_time_secs": single_node_result.elapsed_time_secs,
+                     "code_perf_version": CODE_PERF_VERSION,
+                     "flow": str(SELECTED_FLOW),
+                     "test_index": test_index,
+diff --git a/testsuite/single_node_performance_values.tsv b/testsuite/single_node_performance_values.tsv
+index 5226122321..62b3c8c1a5 100644
+--- a/testsuite/single_node_performance_values.tsv
++++ b/testsuite/single_node_performance_values.tsv
+@@ -1,6 +1,7 @@
+ no-op	1	VM	10	0.981	1.021	50464.0
+ no-op	1000	VM	10	0.980	1.012	48355.8
+ apt-fa-transfer	1	VM	10	0.952	1.014	36305.8
++apt-fa-transfer-sj	1	VM	10	0.952	1.014	36305.8
+ apt-fa-transfer	1	NativeVM	10	0.958	1.052	50195.4
+ account-generation	1	VM	10	0.978	1.009	32220.7
+ account-generation	1	NativeVM	10	0.946	1.063	47587.7

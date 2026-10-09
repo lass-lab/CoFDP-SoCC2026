@@ -1,0 +1,272 @@
+bench-tps: report per-batch send latency and TPS statistics
+
+Every sender thread records, for each batch it sends, the send time of the
+batch in milliseconds and the batch's send rate in transactions per second.
+After upstream's summary, bench-tps prints the elapsed time and summaries of
+both sample sets ("latency stats", "tps stats": mean, stdev, min, p5..p99.999,
+max).
+
+Base: solana-labs/solana tag v1.18.26
+      (commit d9f20e951a06b61e4505da0955228020b96a8915)
+Apply: git apply 0001-bench-tps-per-batch-send-statistics.patch
+License: Apache-2.0, the license of Solana (see LICENSE)
+
+diff --git a/bench-tps/src/batch_stats.rs b/bench-tps/src/batch_stats.rs
+new file mode 100644
+index 000000000..b34f3f3d6
+--- /dev/null
++++ b/bench-tps/src/batch_stats.rs
+@@ -0,0 +1,168 @@
++//! Per-batch send statistics reported at the end of a bench-tps run.
++//!
++//! Every sender thread records two samples for each batch it sends: the time
++//! the batch took (milliseconds, measured like the "Tx send done" log line)
++//! and the batch's send rate (transactions per second). After upstream's
++//! summary the samples are reported as
++//!
++//! ```text
++//! time elapsed <seconds>
++//! latency stats (n = <batches>):
++//! mean    : ...
++//! ...
++//! max     : ...
++//!
++//! Sorted latencies for cumulative graph:
++//! tps stats (n = <batches>):
++//! ...
++//! ```
++//!
++//! The arithmetic (accumulator types and the f32 percentile index) is part of
++//! the reported numbers and must not change.
++
++use {
++    solana_sdk::timing::{duration_as_ms, duration_as_s},
++    std::{fmt::Display, sync::RwLock, time::Instant},
++};
++
++const NUM_PERCENTILES: usize = 15;
++
++/// Reported percentiles with their output labels. The label widths,
++/// including the misaligned "p5" label, are part of the report format.
++const PERCENTILES: [(&str, f32); NUM_PERCENTILES] = [
++    ("p5     ", 5.0),
++    ("p10     ", 10.0),
++    ("p20     ", 20.0),
++    ("p30     ", 30.0),
++    ("p40     ", 40.0),
++    ("p50     ", 50.0),
++    ("p60     ", 60.0),
++    ("p70     ", 70.0),
++    ("p75     ", 75.0),
++    ("p80     ", 80.0),
++    ("p90     ", 90.0),
++    ("p99     ", 99.0),
++    ("p99.9   ", 99.9),
++    ("p99.99  ", 99.99),
++    ("p99.999 ", 99.999),
++];
++
++/// Samples recorded by the sender threads, one entry per sent batch.
++#[derive(Default)]
++pub(crate) struct BatchSamples {
++    /// Time to send each batch, in milliseconds.
++    latencies_ms: RwLock<Vec<u64>>,
++    /// Send rate of each batch, in transactions per second.
++    tps: RwLock<Vec<f32>>,
++}
++
++impl BatchSamples {
++    /// Records a batch of `tx_len` transactions whose send started at
++    /// `transfer_start`. The clock is read after each lock is taken, so a
++    /// sample includes the time spent waiting for that lock.
++    pub(crate) fn record(&self, transfer_start: &Instant, tx_len: usize) {
++        self.latencies_ms
++            .write()
++            .unwrap()
++            .push(duration_as_ms(&transfer_start.elapsed()));
++        self.tps
++            .write()
++            .unwrap()
++            .push(tx_len as f32 / duration_as_s(&transfer_start.elapsed()));
++    }
++
++    /// Prints the elapsed time since `start` and the summaries of both sample
++    /// sets. Must be called after the sender threads have been joined.
++    pub(crate) fn print_report(&self, start: &Instant) {
++        let latency_summary = latency_summary(&self.latencies_ms.read().unwrap());
++        println!("time elapsed {}", duration_as_s(&start.elapsed()));
++        latency_summary.print("latency");
++
++        // This header line is part of the report format; no per-sample dump
++        // follows it.
++        println!("\nSorted latencies for cumulative graph:");
++
++        tps_summary(&self.tps.read().unwrap()).print("tps");
++    }
++}
++
++struct Summary<M, E> {
++    n: usize,
++    mean: M,
++    stdev: M,
++    min: E,
++    percentiles: [f32; NUM_PERCENTILES],
++    max: E,
++}
++
++impl<M: Display, E: Display> Summary<M, E> {
++    fn print(&self, name: &str) {
++        println!("{} stats (n = {}):", name, self.n);
++        println!("mean    : {:.2}", self.mean);
++        println!("stdev   : {:.2}", self.stdev);
++        println!("min     : {:.2}", self.min);
++        for ((label, _), value) in PERCENTILES.iter().zip(self.percentiles.iter()) {
++            println!("{}: {:.2}", label, value);
++        }
++        println!("max     : {:.2}", self.max);
++    }
++}
++
++/// Index of percentile `p` in a sorted sample of `n` values,
++/// ceil(p / 100 * (n - 1)), computed in f32.
++fn percentile_index(n: usize, p: f32) -> usize {
++    ((p / 100.0) * (n as f32 - 1.0)).ceil() as usize
++}
++
++/// Batch send times: mean and standard deviation in f64, percentiles as f32,
++/// min and max as the extreme samples.
++fn latency_summary(samples: &[u64]) -> Summary<f64, u64> {
++    assert!(!samples.is_empty());
++    let n = samples.len();
++    let mean = samples.iter().sum::<u64>() as f64 / n as f64;
++    let variance = samples
++        .iter()
++        .map(|&value| {
++            let diff = value as f64 - mean;
++            diff * diff
++        })
++        .sum::<f64>()
++        / n as f64;
++
++    let mut sorted = samples.to_vec();
++    sorted.sort_unstable();
++    Summary {
++        n,
++        mean,
++        stdev: variance.sqrt(),
++        min: sorted[0],
++        percentiles: PERCENTILES.map(|(_, p)| sorted[percentile_index(n, p)] as f32),
++        max: sorted[n - 1],
++    }
++}
++
++/// Batch send rates: all statistics in f32.
++fn tps_summary(samples: &[f32]) -> Summary<f32, f32> {
++    assert!(!samples.is_empty());
++    let n = samples.len();
++    let mean = samples.iter().sum::<f32>() / n as f32;
++    let variance = samples
++        .iter()
++        .map(|&value| {
++            let diff = value - mean;
++            diff * diff
++        })
++        .sum::<f32>()
++        / n as f32;
++
++    let mut sorted = samples.to_vec();
++    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
++    Summary {
++        n,
++        mean,
++        stdev: variance.sqrt(),
++        min: sorted[percentile_index(n, 0.0)],
++        percentiles: PERCENTILES.map(|(_, p)| sorted[percentile_index(n, p)]),
++        max: sorted[percentile_index(n, 100.0)],
++    }
++}
+diff --git a/bench-tps/src/bench.rs b/bench-tps/src/bench.rs
+index bddce402a..795881cbb 100644
+--- a/bench-tps/src/bench.rs
++++ b/bench-tps/src/bench.rs
+@@ -1,5 +1,6 @@
+ use {
+     crate::{
++        batch_stats::BatchSamples,
+         bench_tps_client::*,
+         cli::{ComputeUnitPrice, Config, InstructionPaddingConfig},
+         perf_utils::{sample_txs, SampleStats},
+@@ -348,6 +349,7 @@ fn create_sender_threads<T>(
+     shared_txs: &SharedTransactions,
+     thread_batch_sleep_ms: usize,
+     total_tx_sent_count: &Arc<AtomicUsize>,
++    batch_samples: &Arc<BatchSamples>,
+     threads: usize,
+     exit_signal: Arc<AtomicBool>,
+     shared_tx_active_thread_count: &Arc<AtomicIsize>,
+@@ -361,6 +363,7 @@ where
+             let shared_txs = shared_txs.clone();
+             let shared_tx_active_thread_count = shared_tx_active_thread_count.clone();
+             let total_tx_sent_count = total_tx_sent_count.clone();
++            let batch_samples = batch_samples.clone();
+             let client = client.clone();
+             Builder::new()
+                 .name("solana-client-sender".to_string())
+@@ -370,6 +373,7 @@ where
+                         &shared_txs,
+                         &shared_tx_active_thread_count,
+                         &total_tx_sent_count,
++                        &batch_samples,
+                         thread_batch_sleep_ms,
+                         &client,
+                     );
+@@ -438,6 +442,7 @@ where
+     let blockhash = Arc::new(RwLock::new(get_latest_blockhash(client.as_ref())));
+     let shared_tx_active_thread_count = Arc::new(AtomicIsize::new(0));
+     let total_tx_sent_count = Arc::new(AtomicUsize::new(0));
++    let batch_samples = Arc::new(BatchSamples::default());
+ 
+     // if we use durable nonce, we don't need blockhash thread
+     let blockhash_thread = if !use_durable_nonce {
+@@ -462,6 +467,7 @@ where
+         &shared_txs,
+         thread_batch_sleep_ms,
+         &total_tx_sent_count,
++        &batch_samples,
+         threads,
+         exit_signal.clone(),
+         &shared_tx_active_thread_count,
+@@ -518,6 +524,7 @@ where
+         &start.elapsed(),
+         total_tx_sent_count.load(Ordering::Relaxed),
+     );
++    batch_samples.print_report(&start);
+ 
+     let r_maxes = maxes.read().unwrap();
+     r_maxes.first().unwrap().1.txs
+@@ -893,6 +900,7 @@ fn do_tx_transfers<T: BenchTpsClient + ?Sized>(
+     shared_txs: &SharedTransactions,
+     shared_tx_thread_count: &Arc<AtomicIsize>,
+     total_tx_sent_count: &Arc<AtomicUsize>,
++    batch_samples: &BatchSamples,
+     thread_batch_sleep_ms: usize,
+     client: &Arc<T>,
+ ) {
+@@ -957,6 +965,7 @@ fn do_tx_transfers<T: BenchTpsClient + ?Sized>(
+             }
+             shared_tx_thread_count.fetch_add(-1, Ordering::Relaxed);
+             total_tx_sent_count.fetch_add(tx_len, Ordering::Relaxed);
++            batch_samples.record(&transfer_start, tx_len);
+             info!(
+                 "Tx send done. {} ms {} tps",
+                 duration_as_ms(&transfer_start.elapsed()),
+diff --git a/bench-tps/src/lib.rs b/bench-tps/src/lib.rs
+index 7da3979a3..8d10f320a 100644
+--- a/bench-tps/src/lib.rs
++++ b/bench-tps/src/lib.rs
+@@ -1,4 +1,5 @@
+ #![allow(clippy::arithmetic_side_effects)]
++mod batch_stats;
+ pub mod bench;
+ pub mod bench_tps_client;
+ pub mod cli;
