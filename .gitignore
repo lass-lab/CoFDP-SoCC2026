@@ -1,0 +1,8 @@
+# Each component keeps its own upstream .gitignore; this file only covers the top level.
+.DS_Store
+__pycache__/
+*.pyc
+# build outputs of scripts/build/ycsb.sh and scripts/build/cachelib.sh
+/YCSB-cpp-fdp/ycsb-f2fs
+/YCSB-cpp-fdp/ycsb-torfs
+/FDP_CACHELIB/opt/

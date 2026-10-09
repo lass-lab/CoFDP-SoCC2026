@@ -1,0 +1,28 @@
+CoFDP: User-Kernel Cooperative Storage for Flexible Data Placement SSDs
+Licensing of this repository
+
+This repository combines modified copies of several open-source projects with
+new code. Every file keeps the license of the project it comes from, and the
+CoFDP changes to a component are released under that component's license.
+The license texts are in the directories listed below.
+
+  Directory                          License
+  ---------------------------------  ---------------------------------------------
+  linux-fdp/                         GPL-2.0 (linux-fdp/COPYING, linux-fdp/LICENSES/)
+  f2fs-tools-fdp/                    GPL-2.0, some library files also LGPL-2.1
+                                     (f2fs-tools-fdp/COPYING)
+  xfsprogs-fdp/                      GPL-2.0 and LGPL-2.1 (xfsprogs-fdp/LICENSES/)
+  ConfFDP/                           GPL-2.0 for FEMU/QEMU, firmware under their own
+                                     licenses (ConfFDP/LICENSE, ConfFDP/COPYING)
+  FDP_ROCKSDB_F2FS/                  GPL-2.0 or Apache-2.0 (RocksDB dual license;
+  FDP_ROCKSDB_TORFS/                 COPYING, LICENSE.Apache, LICENSE.leveldb);
+                                     the TorFS plugin is Apache-2.0
+                                     (FDP_ROCKSDB_TORFS/plugin/torfs/LICENSE)
+  FDP_CACHELIB/, configs/cachelib/   Apache-2.0 (FDP_CACHELIB/LICENSE)
+  YCSB-cpp-fdp/                      Apache-2.0 (YCSB-cpp-fdp/LICENSE)
+  filebench-fdp/                     CDDL-1.0 (filebench-fdp/LICENSE)
+  blockchain-fdp/solana/             Apache-2.0 (blockchain-fdp/solana/LICENSE)
+  blockchain-fdp/aptos/              Innovation-Enabling Source Code License of
+                                     aptos-core (blockchain-fdp/aptos/LICENSE)
+  tools/, scripts/, configs/femu/,   GPL-2.0-only
+  and the top-level documents        (text: linux-fdp/LICENSES/preferred/GPL-2.0)
